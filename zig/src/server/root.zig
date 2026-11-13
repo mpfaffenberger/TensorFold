@@ -175,6 +175,8 @@ test {
     _ = @import("prompt_list_test.zig");
     _ = @import("hf_eos_http_test.zig");
     _ = @import("token_stream_test.zig");
+    _ = @import("prompt_progress.zig");
+    _ = @import("prompt_progress_test.zig");
     _ = @import("reply_gpu_seconds_test.zig");
     _ = @import("spark_wire.zig");
     _ = @import("spark_wire_test.zig");
