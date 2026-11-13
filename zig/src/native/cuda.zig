@@ -464,7 +464,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         .prompt_cache = h.store != null,
         .decode_share = o.decode_share,
         .prompt_cache_capacity = cache_capacity,
-        .warm_turns = h.store != null and @hasDecl(F, "warm_quiet"),
+        .warm_turns = h.store != null and snaps.warmQuiet(F) > 0,
         .logprobs = served.backend.vtable.first_row != null,
         .prompt_logprobs = served.backend.vtable.prompt_rows,
         .penalties = served.backend.penalties,

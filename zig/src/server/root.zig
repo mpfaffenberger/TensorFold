@@ -315,6 +315,7 @@ test {
 
 test {
     _ = @import("request_starts_turns_test.zig");
+    _ = @import("glm_warm_cuts_test.zig");
     _ = @import("thinking_request_test.zig");
     _ = @import("grafana_dashboard_test.zig");
     _ = @import("ocr/types_test.zig");
