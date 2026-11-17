@@ -4,7 +4,7 @@ const sys = @import("sys.zig");
 
 pub const Error = error{InvalidEnvironment};
 pub const Scope = enum { common, cuda, metal, xpu, slide, hooks, dsv41, gemma4, drama3, glm, flashnext, nemotron, minimax_m3, chat };
-pub const Kind = enum { u32, u64, size, percent, positive, device, segments, mib, bit_width, word, prompt, flag, toggle, real, positive_real, signed_real, range, path };
+pub const Kind = enum { u32, u64, size, percent, positive, device, segments, mib, bit_width, word, prompt, flag, toggle, real, positive_real, signed_real, range, path, word_set, pair };
 pub const Rule = struct {
     name: [:0]const u8,
     scope: Scope,
@@ -24,6 +24,16 @@ pub const Rule = struct {
     alias_of: ?[:0]const u8 = null,
     /// False where the old reader took only 0, false and off as off: "no" is refused, not read as off.
     no_word: bool = true,
+    yes_word: bool = true,
+    fold: bool = false,
+    word_values: []const u64 = &.{},
+    word_fallback: ?u64 = null,
+    split: []const u8 = ", ",
+    items: usize = 0,
+    set_switch: bool = false,
+    pair_default: u32 = 8,
+    zero_ok: bool = false,
+    step: u64 = 1,
 };
 
 pub fn isReal(kind: Kind) bool {
@@ -94,10 +104,10 @@ pub const rules = [_]Rule{
     .{ .name = "TF_QWEN27_JOIN", .scope = .metal, .kind = .flag, .forms = "0 or 1 (1 runs a window's rows in pairs in the 27B's decode tail before M5; unset or blank is 1)" },
     .{ .name = "TF_QWEN35_METAL_KV_PAGES", .scope = .metal, .kind = .flag, .forms = "0 or 1 (1 puts the streams' keys and values in core-pool pages; unset or blank is 0)" },
     .{ .name = "TF_DSV41_SMALL", .scope = .metal, .kind = .flag, .forms = "0 or 1 (1 reads a DeepSeek-V4.1 Metal checkpoint's config at its own small shapes)" },
-    .{ .name = "TF_DSV41_ASSETS", .scope = .metal, .kind = .path, .forms = "a directory path without control characters holding DeepSeek-V4.1's Engram token map" },
-    .{ .name = "TF_DSV41_ENGRAM_DIR", .scope = .metal, .kind = .path, .forms = "a directory path without control characters holding DeepSeek-V4.1's packed Engram tables" },
+    .{ .name = "TF_DSV41_ASSETS", .scope = .dsv41, .kind = .path, .forms = "a directory path without control characters holding DeepSeek-V4.1's Engram token map" },
+    .{ .name = "TF_DSV41_ENGRAM_DIR", .scope = .dsv41, .kind = .path, .forms = "a directory path without control characters holding DeepSeek-V4.1's packed Engram tables" },
     .{ .name = "TF_DSV41_ENGRAM_VERIFY", .scope = .metal, .kind = .word, .words = &.{ "sample", "full" }, .forms = "sample or full (full also checks every byte of the Engram tables at boot)" },
-    .{ .name = "TF_DSV41_ENGRAM_CACHE", .scope = .metal, .kind = .u32, .forms = "a whole Engram record count a layer from 0 to 4294967295 (default 65536)" },
+    .{ .name = "TF_DSV41_ENGRAM_CACHE", .scope = .dsv41, .kind = .u32, .forms = "a whole Engram record count a layer from 0 to 4294967295 (default 65536)" },
     .{ .name = "XPU_A8_BITS", .scope = .xpu, .kind = .bit_width, .forms = "4 or 8" },
     .{ .name = "LFM3_FUSE", .scope = .xpu, .kind = .u32, .forms = "a whole fusion mask from 0 to 4294967295" },
     .{ .name = "TF_SLIDE_POCKET_KEY", .scope = .slide, .kind = .word, .words = &.{ "auto", "reply", "subject", "both" }, .forms = "auto, reply, subject or both" },
@@ -243,7 +253,7 @@ pub const rules = [_]Rule{
     .{ .name = "TF_NEMOTRON_WORLD", .scope = .nemotron, .kind = .u64, .forms = "a whole rank count from 1 to 4294967295 (unset with TF_NEMOTRON_RANK gives one rank)" },
     .{ .name = "TF_MINIMAX_RANK", .scope = .minimax_m3, .kind = .u64, .forms = "a whole rank index, 0 or 1 at two ranks (unset with TF_MINIMAX_WORLD gives one rank)" },
     .{ .name = "TF_MINIMAX_WORLD", .scope = .minimax_m3, .kind = .u64, .forms = "a whole rank count, 2 on CUDA (unset with TF_MINIMAX_RANK gives one rank)" },
-};
+} ++ @import("environment_deepseek.zig").rules(Rule);
 
 pub fn rule(name: []const u8) Rule {
     for (rules) |r| if (std.mem.eql(u8, name, r.name)) return r;
@@ -264,8 +274,16 @@ pub fn parse(name: []const u8, raw: ?[]const u8) Error!?u64 {
     const text = std.mem.trim(u8, raw.?, r.trim);
     if (r.first_digit and (text[0] < '0' or text[0] > '9')) return error.InvalidEnvironment;
     if (r.kind == .word) {
-        for (r.words, 0..) |v, i| if (std.mem.eql(u8, text, v)) return i;
-        return error.InvalidEnvironment;
+        for (r.words, 0..) |v, i| if (equal(r, text, v)) return if (r.word_values.len == 0) i else r.word_values[i];
+        return r.word_fallback orelse error.InvalidEnvironment;
+    }
+    if (r.kind == .word_set) return try wordSet(r, text);
+    if (r.kind == .pair) {
+        var it = std.mem.tokenizeScalar(u8, text, ',');
+        const id = std.fmt.parseInt(u32, std.mem.trim(u8, it.next() orelse "", " "), 10) catch return error.InvalidEnvironment;
+        const g = if (it.next()) |v| std.fmt.parseInt(u32, std.mem.trim(u8, v, " "), 10) catch return error.InvalidEnvironment else r.pair_default;
+        if (it.next() != null or id > r.max or g < 1 or g > 1024) return error.InvalidEnvironment;
+        return @as(u64, id) << 32 | g;
     }
     if (r.kind == .toggle) return toggle(r, text) orelse error.InvalidEnvironment;
     // a path travels as 0, its text read by `path`; the file itself is its reader's to check
@@ -294,7 +312,7 @@ pub fn parse(name: []const u8, raw: ?[]const u8) Error!?u64 {
         .segments => 4,
         else => std.math.maxInt(u64),
     };
-    if (n > max or n < r.min or n > r.max) return error.InvalidEnvironment;
+    if (n > max or (n < r.min and !(r.zero_ok and n == 0)) or n > r.max or n % r.step != 0) return error.InvalidEnvironment;
     if (r.only.len > 0 and std.mem.indexOfScalar(u64, r.only, n) == null) return error.InvalidEnvironment;
     if ((r.kind == .positive or r.kind == .segments or r.kind == .mib) and n == 0) return error.InvalidEnvironment;
     if (r.kind == .mib and n > std.math.maxInt(usize) / (1 << 20)) return error.InvalidEnvironment;
@@ -303,8 +321,36 @@ pub fn parse(name: []const u8, raw: ?[]const u8) Error!?u64 {
     return n;
 }
 
+fn equal(r: Rule, a: []const u8, b: []const u8) bool {
+    return if (r.fold) std.ascii.eqlIgnoreCase(a, b) else std.mem.eql(u8, a, b);
+}
+
+fn wordSet(r: Rule, text: []const u8) Error!u64 {
+    if (r.set_switch) {
+        if (std.mem.eql(u8, text, "0")) return 0;
+        if (std.mem.eql(u8, text, "1")) return (@as(u64, 1) << @intCast(r.words.len)) - 1;
+    }
+    var it = std.mem.tokenizeAny(u8, text, r.split);
+    var bits: u64 = 0;
+    var count: usize = 0;
+    while (it.next()) |token| {
+        const v = std.mem.trim(u8, token, " ");
+        var found = false;
+        for (r.words, 0..) |word, i| if (equal(r, v, word)) {
+            bits |= @as(u64, 1) << @intCast(i);
+            found = true;
+            break;
+        };
+        if (!found) return error.InvalidEnvironment;
+        count += 1;
+    }
+    if (r.items != 0 and count != r.items) return error.InvalidEnvironment;
+    return bits;
+}
+
 /// A switch: 0 or 1, or the word forms older readers took, in any case; 0 is off.
 fn toggle(r: Rule, text: []const u8) ?u64 {
+    if (!r.yes_word and std.ascii.eqlIgnoreCase(text, "yes")) return null;
     if (!r.no_word and std.ascii.eqlIgnoreCase(text, "no")) return null;
     for ([_][]const u8{ "0", "false", "off", "no", "1", "true", "on", "yes" }, 0..) |v, i|
         if (std.ascii.eqlIgnoreCase(text, v)) return i / 4;
@@ -320,6 +366,7 @@ fn real(r: Rule, text: []const u8) Error!f64 {
         else => true,
     };
     if (!std.math.isFinite(x) or !low) return error.InvalidEnvironment;
+    if (r.min != 0 and x < @as(f64, @floatFromInt(r.min))) return error.InvalidEnvironment;
     if (r.max != std.math.maxInt(u64) and x > @as(f64, @floatFromInt(r.max))) return error.InvalidEnvironment;
     return x;
 }
@@ -349,7 +396,7 @@ pub fn check(name: [:0]const u8, raw: ?[]const u8) Error!void {
 
 /// One setting in its reader's type: a switch as bool, a real as a float, any other kind as its whole number.
 pub fn value(comptime T: type, name: [:0]const u8, raw: ?[]const u8, default: T) Error!T {
-    std.debug.assert(isReal(rule(name).kind) == (@typeInfo(Plain(T)) == .float) and rule(name).kind != .range and rule(name).kind != .path);
+    std.debug.assert(isReal(rule(name).kind) == (@typeInfo(Plain(T)) == .float) and rule(name).kind != .range and rule(name).kind != .path and rule(name).kind != .pair);
     return decode(T, (try checked(name, raw)) orelse return default);
 }
 
@@ -374,6 +421,11 @@ pub fn read(comptime T: type, name: [:0]const u8, default: T) Error!T {
 pub fn range(name: [:0]const u8, raw: ?[]const u8) Error!?[2]u32 {
     const n = (try checked(name, raw)) orelse return null;
     return .{ @intCast(n >> 32), @truncate(n) };
+}
+
+pub fn pair(name: [:0]const u8, raw: ?[]const u8) Error!?[2]u32 {
+    std.debug.assert(rule(name).kind == .pair);
+    return range(name, raw);
 }
 
 /// A `.path` setting's text, or null when unset or blank; nothing is logged, so the caller words the refusal.
@@ -455,12 +507,13 @@ pub fn refusal(a: std.mem.Allocator, environment: anytype, flags: Flags) !?[]con
 }
 
 pub const Process = struct {
-    pub fn get(_: Process, name: [:0]const u8) ?[]const u8 {
+    pub fn get(_: Process, name: [:0]const u8) ?[:0]const u8 {
         return sys.getenv(name);
     }
 };
 
 test {
     _ = @import("environment_test.zig");
+    _ = @import("environment_deepseek_test.zig");
     _ = @import("environment_flashnext_test.zig");
 }
