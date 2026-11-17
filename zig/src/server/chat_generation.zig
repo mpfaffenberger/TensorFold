@@ -75,6 +75,7 @@ pub const Generation = struct {
     lp: ?@import("logprob_parts.zig").Live = null, // the request asked for logprobs: its rows, copied with each round
     loop_stop: bool = false, // --loop-guard-stop: the engine ends the reply where the loop guard fires
     recover: bool = false, // a chat request with no forced tool or structure: an unclosed think block may be the answer
+    prompt_ids: []const u32 = &.{}, // the rendered prompt: TF_CACHE_WHY's message index reads it
 
     fn eos(g: *const Generation, t: u32) bool {
         return !g.ignore_eos and std.mem.indexOfScalar(u32, g.srv.eos, t) != null;
@@ -388,6 +389,8 @@ pub const Generation = struct {
             try runtime.put(a, "token_ids", .{ .array = reply_ids });
         }
         try runtime.put(a, "min_rows", try json.intValue(a, m.stats.min_rows));
+        if (m.stats.prompt_cache) |w| g.srv.metrics.noteCache(g.srv.io, w);
+        if (g.srv.config.cache_why) if (m.stats.prompt_cache) |w| try runtime.put(a, "prompt_cache", try @import("cache_why.zig").value(g.srv, a, w, g.prompt_ids));
         if (m.stats.loop_period) |period| {
             const loop_field = try json.newObject(a);
             try loop_field.put(a, "period", try json.intValue(a, period));
@@ -443,7 +446,9 @@ pub const Generation = struct {
         reply.queued_s = s.queued_seconds;
         reply.ttft_s = if (g.first_ns != null) ttft_s else null;
         reply.decode_tps = rate;
-        log.line("done {s} prompt={d} cached={d} thinking={s} effort={s} tokens={d} sha={s} finish={s}{s} rounds={d} accepted={d}/{d} ttft={d:.3} decode={d:.3} elapsed={d:.3} queued={d:.3} tok/s={d:.1}{s}", .{ g.reply_id, prompt_len, reply.cached_tokens, if (thinking) "True" else "False", if (thinking) effort orelse "none" else "none", g.collected.items.len, sha, reason, cycle, s.rounds, s.accepted, s.drafted, ttft_s, decode_log_s, @max(0, seconds(done_ns - received)), s.queued_seconds, rate, seed });
+        var why_text: [64]u8 = undefined;
+        const why_line = @import("cache_why.zig").logged(&why_text, m.stats.prompt_cache);
+        log.line("done {s} prompt={d} cached={d} thinking={s} effort={s} tokens={d} sha={s} finish={s}{s} rounds={d} accepted={d}/{d} ttft={d:.3} decode={d:.3} elapsed={d:.3} queued={d:.3} tok/s={d:.1}{s}{s}", .{ g.reply_id, prompt_len, reply.cached_tokens, if (thinking) "True" else "False", if (thinking) effort orelse "none" else "none", g.collected.items.len, sha, reason, cycle, s.rounds, s.accepted, s.drafted, ttft_s, decode_log_s, @max(0, seconds(done_ns - received)), s.queued_seconds, rate, seed, why_line });
         return reply;
     }
 };
