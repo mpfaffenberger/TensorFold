@@ -132,6 +132,7 @@ const valid = [_]Case{
     .{ .name = "TF_DSV41_ENGRAM_VERIFY", .raw = "full", .n = 1 },
     .{ .name = "TF_DSV41_ENGRAM_CACHE", .raw = "0", .n = 0 },
     .{ .name = "TF_DSV41_DSPARK_BLOCK", .raw = "7", .n = 7 },
+    .{ .name = "TF_DSV41_MARKOV_GPU", .raw = "1", .n = 1 },
 };
 
 test "environment: valid forms remain raw numbers before existing consumer clamps and defaults" {
