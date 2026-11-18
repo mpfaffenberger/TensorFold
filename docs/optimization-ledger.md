@@ -256,7 +256,7 @@ below; these are estimates for planning a port, not results.
 | 25. TP ranks | big | big | big | scale-out: models past one box |
 | 26. Pipeline | none | none | big | fits models across nodes; adds hops |
 | 27. Profiles | none | none | none | names the opt-in switches |
-| 28. Scale index | none | low | 5 % of the weights once prompts read it too | one stream's decode before tensor units |
+| 28. Scale index | none | low | 5 % of the weights once prompts read it too | one stream's decode; default before tensor units, opt-in on M5 |
 | 29. DSpine | none | medium | low | Qwen3.8-27B; agent 2–20 % faster, chat and code 10–19 % slower |
 
 ## The optimizations
@@ -471,8 +471,9 @@ below; these are estimates for planning a port, not results.
     table of pairs gives a kernel the same two values from fewer bytes. Flash Next's 4-bit expert kernels read it on
     Macs before tensor units ([#2760], plan in [#2751]); its prompt gathers and grouped expert kernels read it too,
     the routed experts' stored arrays are released and it is the default, `TF_FLASHNEXT_SCALE_INDEX=0` turning it
-    off ([#2805]). The dense rows still read the stored arrays. `?` cells: the same count has not been run on those
-    checkpoints.
+    off ([#2805]). On M5 `TF_FLASHNEXT_SCALE_INDEX=1` turns it on too, opt-in until the tensor-unit prompt gathers
+    are checked there ([#3277]). The dense rows still read the stored arrays. `?` cells: the same count has not been
+    run on those checkpoints.
 
 29. **DSpine drafter.** Tencent's DSpine-b16 for Qwen3.8-27B, opt-in by `--drafter` with its folder, never the
     default. It reuses DFlash2's taps and tap ring and adds a code bridge and an exact-sender table.
@@ -632,3 +633,4 @@ below; these are estimates for planning a port, not results.
 [#2764]: https://github.com/ashhart/TensorFold/issues/2764
 [#2977]: https://github.com/ashhart/TensorFold/pull/2977
 [#2805]: https://github.com/ashhart/TensorFold/pull/2805
+[#3277]: https://github.com/ashhart/TensorFold/pull/3277
