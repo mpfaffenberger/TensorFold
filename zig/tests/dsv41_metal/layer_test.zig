@@ -18,6 +18,7 @@ test {
     _ = @import("zerocopy_test.zig");
     _ = @import("prompt_test.zig");
     _ = @import("dspark_test.zig");
+    _ = @import("early_test.zig");
     _ = @import("multi_test.zig");
     _ = @import("units_test.zig");
     _ = @import("tile_test.zig");
