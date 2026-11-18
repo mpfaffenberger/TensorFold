@@ -66,6 +66,14 @@ pub const Job = struct {
         @import("lane_cache_queue.zig").keep(job.host, job, s, at);
     }
 
+    /// A yielding warm pass ends at this prefix; its unused endpoint reservation can fund a queued follow-up.
+    pub fn interrupted(ptr: *anyopaque, s: *lanes.Stream, at: u32) void {
+        const job: *Job = @ptrCast(@alignCast(ptr));
+        job.reached = @max(job.reached, at);
+        job.reported();
+        @import("lane_cache_queue.zig").interrupted(job.host, job, s, at);
+    }
+
     /// Report a restored prefix or its failed copy; an untouched prefix remains kept.
     pub fn reported(job: *Job) void {
         const e = job.entry orelse return;
