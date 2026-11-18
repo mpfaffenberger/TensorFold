@@ -58,4 +58,3 @@ const Hook = struct {
         b.queue(b.ctx, h.group, h.t.b.logits.buf, h.t.b.logits.off, tb);
     }
 };
-
