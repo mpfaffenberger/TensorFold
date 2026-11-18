@@ -4,7 +4,7 @@ const mtl = @import("metal");
 const host = @import("dsv41");
 const kv = @import("kv.zig");
 const rope = @import("rope.zig");
-const ctx_ = @import("ctx.zig");
+const launch_ = @import("target_launch.zig");
 const scratch = @import("scratch.zig");
 const forward = @import("forward.zig");
 const prompt = @import("prompt.zig");
@@ -42,6 +42,13 @@ pub const Options = struct {
     cache_bytes: u64 = 0,
     /// the weights' residency owner, which the target's own buffers join inside its load limit (null: none join)
     resident: ?*mtl.resident.Resident = null,
+};
+
+/// The drafter's work behind a window: `queue` right after its command buffers, `drain` before the target writes.
+pub const Behind = struct {
+    ctx: *anyopaque,
+    queue: *const fn (ctx: *anyopaque, group: []const iface.Segment, logits: mtl.Buffer, off: usize, taps: mtl.Buffer) void,
+    drain: *const fn (ctx: *anyopaque) anyerror!void,
 };
 
 /// What the target did, for the tests and the logs.
@@ -89,6 +96,8 @@ pub const Target = struct {
     /// sampled picks' float64 logits (picks.rows rows) and the ids 0 .. vocab - 1, kept between picks
     pick_vals: []f64 = &.{},
     pick_ids: []u64 = &.{},
+    /// the drafter's work behind a window (null: none)
+    behind: ?Behind = null,
 
     pub fn init(a: Allocator, env: Env, opt: Options) !*Target {
         const c = env.c;
@@ -198,6 +207,11 @@ pub const Target = struct {
         return @ptrCast(@alignCast(ptr));
     }
 
+    /// The drafter's queued work done before the target writes what it reads.
+    fn drainBehind(t: *Target) !void {
+        if (t.behind) |b| try b.drain(b.ctx);
+    }
+
     /// The device buffer and offset of an address a `taps` named (the pass's ingest reads it there).
     pub fn bufferOf(t: *const Target, address: u64) ?struct { buf: mtl.Buffer, off: usize } {
         for (t.slots) |s| {
@@ -220,6 +234,7 @@ pub const Target = struct {
     fn prefill(ptr: *anyopaque, slot: u32, ids: []const u32, smp: ?lanes.Sampling, draw: u64) anyerror!u32 {
         const t = self(ptr);
         if (slot >= t.slots.len) return error.NoSlot;
+        try t.drainBehind();
         const s = &t.slots[slot];
         const c = t.env.c;
         if (s.live) return error.SlotLive;
@@ -364,6 +379,7 @@ pub const Target = struct {
     /// A round's windows: slots' rows share a launch (up to R rows, a slot once), each launch one forward.
     fn window(ptr: *anyopaque, segments: []const iface.Segment, choices: [][]u32) anyerror!void {
         const t = self(ptr);
+        try t.drainBehind();
         // the tree windows (parents not one chain) run first, together: their branches on shadow slots
         try t.tree.window(t, segments, choices);
         var from: usize = 0;
@@ -461,49 +477,14 @@ pub const Target = struct {
             const s = &t.slots[g.slot];
             r.* = .{ .kv = &s.kv, .ids = g.tokens, .start = @intCast(g.start), .lookback = s.hist.items[@as(usize, @intCast(g.start)) -| look..@intCast(g.start)] };
         }
-        return t.launchRuns(runs[0..group.len]);
+        return launch_.run(t, runs[0..group.len], group);
     }
 
-    /// One chain of a launch: the state it runs on, its ids from position `start`, the Engram ids before them.
-    pub const Run = struct { kv: *const kv.Slot, ids: []const u32, start: u32, lookback: []const u32 };
+    pub const Run = launch_.Run;
 
-    /// One launch of the decode forward over the runs' rows, in order (at most R rows).
     pub fn launchRuns(t: *Target, runs: []const Run) !void {
-        const e = t.env;
-        const c = e.c;
-        var pieces: [R]forward.Piece = undefined;
-        var spans: [R]scratch.Span = undefined;
-        var segs: [R]ctx_.Seg = undefined;
-        var r0: u32 = 0;
-        for (runs, 0..) |g, i| {
-            const n: u32 = @intCast(g.ids.len);
-            pieces[i] = .{ .ids = g.ids, .lookback = g.lookback };
-            spans[i] = .{ .p0 = g.start, .n = n };
-            segs[i] = .{ .slot = g.kv, .p0 = g.start, .r0 = r0, .n = n };
-            r0 += n;
-        }
-        // the Engram rows' reads start now; each layer's rows land as its command buffer comes up (Hook.rows)
-        const look_up = try forward.prepareIds(&t.b, c, pieces[0..runs.len], e.lookup);
-        if (look_up) |l| forward.prefetchRows(pieces[0..runs.len], l);
-        try e.s.writeSpans(c, spans[0..runs.len]);
-        const x: ctx_.Ctx = .{ .c = c, .p = e.p, .s = e.s, .slot = segs[0].slot, .tables = e.tables, .p0 = segs[0].p0, .rows = r0, .segs = segs[0..runs.len] };
-        const pool = mtl.objc.Pool.push();
-        defer pool.pop();
-        var hook: Hook = .{ .t = t, .pieces = pieces[0..runs.len], .look_up = look_up };
-        try forward.runWith(&x, e.queue, e.model, &t.b, .{ .ctx = &hook, .rows = if (look_up != null) Hook.rows else null });
+        return launch_.run(t, runs, &.{});
     }
-
-    /// A launch's hook: each Engram layer's rows before the command buffer that reads them.
-    const Hook = struct {
-        t: *Target,
-        pieces: []const forward.Piece,
-        look_up: ?forward.Lookup,
-
-        fn rows(ctx: *anyopaque, li: usize) anyerror!void {
-            const h: *Hook = @ptrCast(@alignCast(ctx));
-            try forward.fillRows(&h.t.b, h.t.env.c, h.pieces, h.look_up.?, li);
-        }
-    };
 
     /// Keep the window's first rows (a chain from row 0): later rows' ids go, the compressor's carry rewinds.
     fn keep(ptr: *anyopaque, slot: u32, path: []const u32) anyerror!void {
@@ -537,6 +518,8 @@ pub const Target = struct {
     fn history(ptr: *anyopaque, slot: u32, start: u64, rows: u32) ?iface.Taps {
         const t = self(ptr);
         if (slot >= t.slots.len) return null;
+        // the rows land in the prompt-taps buffer a queued ingest may still read
+        t.drainBehind() catch return null;
         const s = &t.slots[slot];
         const c = t.env.c;
         const w = tapWidth(c);
