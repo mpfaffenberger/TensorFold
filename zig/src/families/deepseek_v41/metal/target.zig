@@ -11,6 +11,7 @@ const prompt = @import("prompt.zig");
 const pipelines = @import("pipelines.zig");
 const snapshots = @import("snapshots.zig");
 const tree_ = @import("tree.zig");
+const picks = @import("picks.zig");
 
 const iface = host.iface;
 const lanes = host.lanes;
@@ -85,7 +86,7 @@ pub const Target = struct {
     joined: bool = false,
     /// draft trees: the branches' shadow slots and the open tree window (tree.zig)
     tree: tree_.Tree = .{},
-    /// a sampled pick's float64 logits and its ids 0 .. vocab - 1, kept between picks
+    /// sampled picks' float64 logits (picks.rows rows) and the ids 0 .. vocab - 1, kept between picks
     pick_vals: []f64 = &.{},
     pick_ids: []u64 = &.{},
 
@@ -100,7 +101,7 @@ pub const Target = struct {
         errdefer t.b.deinit();
         t.pr = try prompt.Prompt.init(env.device, c, opt.prompt, opt.limit);
         errdefer t.pr.deinit();
-        t.pick_vals = try a.alloc(f64, c.vocab);
+        t.pick_vals = try a.alloc(f64, picks.rows * @as(usize, c.vocab));
         errdefer a.free(t.pick_vals);
         t.pick_ids = try a.alloc(u64, c.vocab);
         errdefer a.free(t.pick_ids);
@@ -421,7 +422,10 @@ pub const Target = struct {
         for (group, choices) |g, out| {
             const s = &t.slots[g.slot];
             const n = g.tokens.len;
-            for (0..n) |r| out[r] = try t.choose(lg[(r0 + r) * V ..][0..V], g.draws[r], g.sampling);
+            const keyed = if (g.sampling) |smp| smp.temperature > 0 and n > 1 else false;
+            if (keyed) try picks.keyed(lg[r0 * V ..][0 .. n * V], g.draws, g.sampling.?, t.pick_vals, t.pick_ids, out[0..n]) else {
+                for (0..n) |r| out[r] = try t.choose(lg[(r0 + r) * V ..][0..V], g.draws[r], g.sampling);
+            }
             s.base = g.start;
             s.rows = @intCast(n);
             s.open = true;
