@@ -88,7 +88,7 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     if (target.result.os.tag == .linux and std.mem.eql(u8, hip_arch, "gfx1151")) {
         const dir = "zig/kernels/hip/inkling_mini/";
         const mini = hipccRun(b, hipcc, &.{ "-std=c++17", "-O2", "--offload-arch=gfx1151" });
-        for ([_][]const u8{ "model.hpp", "model_ops.hpp", "engine.hpp", "engine_checkpoint.hpp", "attention.hpp", "moe.hpp", "tokenizer.hpp", "serve.hpp", "serve_http.hpp", "serve_chat.hpp", "context.hpp", "generate.hpp", "vision.hpp", "vision_ops.hpp", "vision_png.hpp" }) |name|
+        for ([_][]const u8{ "model.hpp", "model_ops.hpp", "engine.hpp", "engine_checkpoint.hpp", "attention.hpp", "moe.hpp", "tokenizer.hpp", "serve.hpp", "serve_http.hpp", "serve_chat.hpp", "context.hpp", "generate.hpp", "attention_batch.hpp", "moe_batch.hpp", "prefill.hpp", "prefill_ops.hpp", "vision.hpp", "vision_ops.hpp", "vision_png.hpp" }) |name|
             mini.addFileInput(b.path(b.fmt("{s}{s}", .{ dir, name })));
         mini.addFileArg(b.path(dir ++ "main.hip"));
         mini.addArgs(&.{ "-lpcre2-8", "-lhipblas", "-lz", "-o" });

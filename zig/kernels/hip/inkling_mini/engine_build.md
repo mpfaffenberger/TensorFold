@@ -68,6 +68,9 @@ Supply non-interlaced 8-bit PNG (gray, gray+alpha, RGB or RGBA), up to 256
 merged visual tokens (`ceil(width/40) * ceil(height/40)`). The decoder does
 not fetch remote URLs, accept JPEGs, or silently downsample oversized images.
 Total context includes the template, visual tokens and requested output. The
-limit is 16,384, **not** the checkpoint's advertised 1M; prefill processes one
-token at a time. The JSON body cap is 8 MiB, including base64; text is capped
+limit is 16,384, **not** the checkpoint's advertised 1M. Prefill processes 32-token
+chunks through all 48 visits and projects only the final prompt position to logits.
+Generation after the first token still uses the scalar decoder. Set
+`TF_INKLING_TIMINGS=1` on the server process to log prefill time (including lazy
+weight uploads on a cold engine) separately from subsequent-token decode time. The JSON body cap is 8 MiB, including base64; text is capped
 at 32 KiB. Long requests occupy the server until completion.
