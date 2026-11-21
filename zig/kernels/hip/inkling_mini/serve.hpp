@@ -67,7 +67,7 @@ inline bool authorized(const ServeOptions& options, const std::string& authoriza
 
 // One chat completion. Returns the JSON body for a plain reply, or null once a
 // stream has been written to the client.
-inline Json chat(int fd, const ServeOptions& options, Engine& engine, TextCodec& codec,
+inline Json chat(int fd, const ServeOptions& options, Engine& engine, PrefixCache& cache, TextCodec& codec,
                  const std::string& body, unsigned long serial) {
     ChatRequest request = parse_chat(body,options.model);
     mini_vision::ImagePatches image{};
@@ -79,14 +79,14 @@ inline Json chat(int fd, const ServeOptions& options, Engine& engine, TextCodec&
             for (auto& part : message.parts)
                 if (part.image) part.rows = size_t(image.rows)*image.cols;
     }
-    const std::vector<int> prompt = codec.conversation(request.messages,request.effort);
+    const std::vector<int> prompt = codec.conversation(request.messages,request.effort,request.tools);
     if (prompt.size() >= size_t(options.context)) throw Error(400,"the conversation does not fit the context window");
     const int room = options.context-int(prompt.size());
     const int budget = std::min({request.max_tokens ? request.max_tokens : options.max_tokens,options.max_tokens,room});
 
     if (!request.stream) {
         std::vector<int> ids;
-        inkling_generate(engine,prompt,image,budget,[&](int id) { ids.push_back(id); return true; });
+        inkling_generate(engine,prompt,image,budget,[&](int id) { ids.push_back(id); return true; },&cache);
         return completion(ids,codec,options.model,prompt.size(),serial);
     }
 
@@ -104,6 +104,15 @@ inline Json chat(int fd, const ServeOptions& options, Engine& engine, TextCodec&
         connected = send_event(fd,dump(chunk(options.model,serial,{{field,pending.substr(0,ready_bytes)}})));
         pending.erase(0,ready_bytes);
     };
+    // A tool call is relayed whole once the model has finished printing it.
+    size_t relayed = 0;
+    auto relay_calls = [&] {
+        for (; connected && relayed < splitter.calls.size(); ++relayed) {
+            Json call = tool_call(splitter.calls[relayed]);
+            call["index"] = relayed;
+            connected = send_event(fd,dump(chunk(options.model,serial,{{"tool_calls",Json::array({call})}})));
+        }
+    };
     int generated = 0;
     try {
         generated = inkling_generate(engine,prompt,image,budget,[&](int id) {
@@ -111,15 +120,18 @@ inline Json chat(int fd, const ServeOptions& options, Engine& engine, TextCodec&
             if (splitter.channel != pending_channel) { flush(true); pending_channel = splitter.channel; }
             pending.append(bytes);
             flush(false);
+            relay_calls();
             return connected;
-        });
+        },&cache);
     } catch (const std::exception& error) {
         std::cerr << "Inkling generation: " << error.what() << '\n';
         if (connected) send_event(fd,dump(Json{{"error",{{"message","generation failed"},{"type","server_error"}}}}));
         return nullptr;
     }
     flush(true);
-    if (connected) connected = send_event(fd,dump(chunk(options.model,serial,Json::object(),splitter.finished ? "stop" : "length")));
+    splitter.finish();
+    relay_calls();
+    if (connected) connected = send_event(fd,dump(chunk(options.model,serial,Json::object(),splitter.finish_reason())));
     if (connected && request.usage_event) {
         Json tail = envelope("chat.completion.chunk",options.model,serial);
         tail["choices"] = Json::array();
@@ -140,6 +152,7 @@ inline int inkling_serve(int argc, char** argv) {
     Socket server = listen_on(options);
     TextCodec codec(options.checkpoint);
     Engine engine(options.checkpoint);
+    PrefixCache cache;
     std::cerr << "Inkling serving " << options.model << " on http://" << options.host << ":" << options.port
               << (options.key.empty() ? "" : " (API key required)") << std::endl;
     // Without a key the listener is loopback: refuse foreign Host headers so a web page cannot reach it.
@@ -157,7 +170,7 @@ inline int inkling_serve(int argc, char** argv) {
                 Json entry = {{"id",options.model},{"object","model"},{"created",0},{"owned_by","local"}};
                 response = {{"object","list"},{"data",Json::array({entry})}};
             } else if (request.line == "POST /v1/chat/completions") {
-                response = chat(client.fd,options,engine,codec,request.body,++serial);
+                response = chat(client.fd,options,engine,cache,codec,request.body,++serial);
                 if (response.is_null()) continue; // already streamed
             } else throw Error(404,"unknown route or method");
         } catch (const Error& error) { status = error.status; response = error.what(); }

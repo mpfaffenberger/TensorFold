@@ -1,5 +1,5 @@
-// Parity of the batched prefill operators against the scalar decode kernels on
-// identical inputs, on a real device with the real checkpoint:
+// Parity of the batched prefill operators, and of the state they save for
+// resuming, against the scalar decode kernels on identical inputs, on a real device with the real checkpoint:
 //   hipcc -std=c++17 -O2 --offload-arch=gfx1151 batch_test.hip -lhipblas -o batch-test
 //   ./batch-test /path/to/Inkling-2-Mini
 // GEMMs reassociate sums, so results agree to BF16 rounding noise, not bit for bit.
@@ -46,7 +46,7 @@ static void compare(const char* what, const float* scalar, const float* batched,
     double relative = std::sqrt(error/std::max(power,1e-30));
     bool ok = relative <= tolerance && power > 0;
     failed |= !ok;
-    std::printf("%-44s %s relative rms %.2e, max |diff| %.2e, output rms %.3f, %.2f%% elements differ\n",
+    std::printf("%-52s %s relative rms %.2e, max |diff| %.2e, output rms %.3f, %.2f%% elements differ\n",
                 what, ok ? "PASS" : "FAIL", relative, worst, std::sqrt(power/count), 100.*differing/count);
 }
 // Scalar attention for every position under one visit key; batched under another, in two chunks.
@@ -63,6 +63,30 @@ static void attention_case(Engine& e, const char* what, int layer, int rows, int
     attn_forward_qkv(e,layer,46,rows,next,next,next,after_scalar);
     attn_forward_qkv(e,layer,47,rows,next,next,next,after_batched);
     compare("  scalar decode continuing from each cache",after_scalar,after_batched,H,2e-3);
+}
+// The conv rings a batched chunk saves for a boundary must be the rings the
+// scalar path holds after as many positions: inside a chunk, at its end, and
+// one or two positions into a chunk, where part of the ring predates it.
+static void checkpoint_case(Engine& e, const char* what, int layer, int split, int rows, const std::vector<int>& boundaries) {
+    using inkling_checkpoint::Mark;
+    float *q = inputs(e,"test.q",rows,13), *k = inputs(e,"test.k",rows,29), *v = inputs(e,"test.v",rows,41);
+    float *scalar = e.tmp("test.scalar",size_t(rows)*H), *batched = e.tmp("test.batched",size_t(rows)*H);
+    const std::string reference = inkling_context::state(layer,44), under_test = inkling_context::state(layer,45);
+    const std::pair<const char*,int> rings[] = {{"khist",4*1024},{"vhist",4*1024},{"ohist",4*H}};
+    std::vector<Mark> early, late;
+    for (size_t i = 0; i < boundaries.size(); ++i) (boundaries[i] <= split ? early : late).push_back({boundaries[i],int(i)});
+    attn_batch(e,layer,45,0,q,k,v,batched,split,early);
+    attn_batch(e,layer,45,split,q+size_t(split)*H,k+size_t(split)*H,v+size_t(split)*H,batched+size_t(split)*H,rows-split,late);
+    for (int pos = 0; pos < rows; ++pos) {
+        attn_forward_qkv(e,layer,44,pos,q+size_t(pos)*H,k+size_t(pos)*H,v+size_t(pos)*H,scalar+size_t(pos)*H);
+        for (size_t i = 0; i < boundaries.size(); ++i) {
+            if (boundaries[i] != pos+1) continue;
+            for (const auto& [ring,width] : rings) {
+                const std::string label = std::string(what)+", after "+std::to_string(pos+1)+" positions, "+ring;
+                compare(label.c_str(),e.tmp(reference+ring,width),inkling_checkpoint::saved(e,under_test+ring,width,int(i)),width,2e-3);
+            }
+        }
+    }
 }
 static void moe_case(Engine& e, const char* what, int layer, int rows) {
     float* x = inputs(e,"test.q",rows,71);
@@ -84,6 +108,8 @@ int main(int argc, char** argv) try {
     attention_case(e,"sliding attention, 40 rows",0,40,25);
     attention_case(e,"sliding attention across the 1024 window",0,1200,700);
     attention_case(e,"full attention, 300 rows",5,300,200);
+    checkpoint_case(e,"sliding rings",0,40,90,{17,40,41,42,45,90});
+    checkpoint_case(e,"full rings",5,40,90,{17,40,41,42,45,90});
     moe_case(e,"NVFP4 experts, direct rows (20)",0,20);
     moe_case(e,"NVFP4 experts, dequantize + GEMM (400)",0,400);
     moe_case(e,"MXFP8 experts, dequantize + GEMM (400)",20,400);

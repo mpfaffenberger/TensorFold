@@ -33,38 +33,44 @@ public:
         std::ifstream json(dir+"/tokenizer.json"); const auto cfg=nlohmann::json::parse(json);for(auto& t:cfg.at("added_tokens")){std::string s=t.at("content");int n=t.at("id");special[s]=n;words.at(n)=s;}std::string pattern=cfg.at("pre_tokenizer").at("pretokenizers").at(0).at("pattern").at("Regex");int err;size_t off;code=pcre2_compile((PCRE2_SPTR)pattern.data(),pattern.size(),PCRE2_UTF|PCRE2_UCP,&err,&off,nullptr);if(!code)throw std::runtime_error("invalid tokenizer regex");}
     ~TextCodec(){pcre2_code_free(code);}
     const std::string& word(int id)const{return words.at(id);}
-    // chat_template.jinja for system, user and assistant turns with text and
-    // image parts. The thinking-effort system message precedes the first
-    // non-system message; every part is its own role-tagged segment; an
-    // assistant turn closes with end-of-sampling. There is no generation
-    // prompt. Message text is never scanned for control tokens.
-    std::vector<int> conversation(const std::vector<ChatMessage>& messages, const std::string& effort) const {
+    // chat_template.jinja: an optional tool declaration, then system, user,
+    // assistant and tool turns. The thinking-effort system message precedes
+    // the first non-system message; every part is its own role-tagged segment;
+    // an assistant turn lists its tool calls and closes with end-of-sampling.
+    // There is no generation prompt. Message text is never scanned for control
+    // tokens. `tools` is the declaration JSON, empty for none.
+    std::vector<int> conversation(const std::vector<ChatMessage>& messages, const std::string& effort,
+                                  const std::string& tools = {}) const {
         std::vector<int> ids;
         auto tag = [&](const char* name) { ids.push_back(special.at(name)); };
-        auto segment = [&](const char* role, const char* kind, const std::string& body) {
-            tag(role); tag(kind); text(ids, body); tag("<|end_message|>");
+        // role token, optional label text, content kind, body, end of message
+        auto segment = [&](const char* role, const std::string& label, const char* kind, const std::string& body) {
+            tag(role); text(ids, label); tag(kind); text(ids, body); tag("<|end_message|>");
         };
+        if (!tools.empty()) segment("<|message_system|>", "tool_declare", "<|content_xml|>", tools);
         bool effort_emitted = false;
         auto emit_effort = [&] {
-            segment("<|message_system|>", "<|content_text|>", "Thinking effort level: " + effort);
+            segment("<|message_system|>", {}, "<|content_text|>", "Thinking effort level: " + effort);
             effort_emitted = true;
         };
         for (const auto& message : messages) {
             const bool assistant = message.role == "assistant";
-            const char* role = message.role == "system" ? "<|message_system|>"
-                             : assistant ? "<|message_model|>" : "<|message_user|>";
+            const char* role = message.role == "system" ? "<|message_system|>" : assistant ? "<|message_model|>"
+                             : message.role == "tool" ? "<|message_tool|>" : "<|message_user|>";
             if (!effort_emitted && message.role != "system") emit_effort();
-            const bool reasoned = assistant && !message.reasoning.empty();
-            if (reasoned) segment(role, "<|content_thinking|>", message.reasoning);
+            if (assistant && !message.reasoning.empty()) segment(role, message.label, "<|content_thinking|>", message.reasoning);
+            // An assistant turn that reasoned or called tools prints no empty answer.
+            const bool silent = assistant && (!message.reasoning.empty() || !message.calls.empty());
             for (const auto& part : message.parts) {
                 if (part.image) {
-                    tag(role); tag("<|content_image|>");
+                    tag(role); text(ids, message.label); tag("<|content_image|>");
                     ids.insert(ids.end(), part.rows, special.at("<|unused_200054|>"));
                     tag("<|end_message|>");
-                } else if (message.listed || !part.text.empty() || !reasoned) {
-                    segment(role, "<|content_text|>", part.text);
+                } else if (message.listed || !part.text.empty() || !silent) {
+                    segment(role, message.label, "<|content_text|>", part.text);
                 }
             }
+            for (const auto& call : message.calls) segment("<|message_model|>", call.name, "<|content_invoke_tool_json|>", call.body);
             if (assistant) tag("<|content_model_end_sampling|>");
         }
         if (!effort_emitted) emit_effort();
@@ -72,7 +78,9 @@ public:
     }
     // One user turn at zero thinking effort: an optional image, then the text.
     std::vector<int> turn(const std::string& prompt, size_t rows = 0) const {
-        ChatMessage user{"user", {}, {}, true};
+        ChatMessage user;
+        user.role = "user";
+        user.listed = true;
         if (rows) user.parts.push_back({true, {}, rows});
         if (!rows || !prompt.empty()) user.parts.push_back({false, prompt, 0});
         return conversation({user}, "0");

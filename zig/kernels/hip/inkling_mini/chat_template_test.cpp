@@ -19,7 +19,7 @@ int main(int argc, char** argv) try {
         for (auto& message : request.messages)
             for (auto& part : message.parts)
                 if (part.image) part.rows = 1;
-        const auto ids = codec.conversation(request.messages, request.effort);
+        const auto ids = codec.conversation(request.messages, request.effort, request.tools);
         const auto expected = item.at("token_ids").get<std::vector<int>>();
         size_t at = 0;
         while (at < ids.size() && at < expected.size() && ids[at] == expected[at]) ++at;

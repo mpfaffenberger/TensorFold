@@ -13,10 +13,13 @@ static int status_of(const std::string& raw) {
     try { parse_chat(raw,"test"); } catch (const Error& error) { return error.status; } catch (const Json::exception&) { return 400; }
     return 200;
 }
-// Stand-in vocabulary: control tokens, two text tokens, and a three-byte character split across two tokens.
+// Stand-in vocabulary: control tokens, text tokens, a three-byte character split
+// across two tokens, and the pieces of two tool calls.
 struct Words {
     std::vector<std::string> table{"<|message_model|>","<|content_thinking|>","private","<|end_message|>","<|content_text|>",
-                                   "answer","<|content_model_end_sampling|>","\xE2\x82","\xAC"};
+                                   "answer","<|content_model_end_sampling|>","\xE2\x82","\xAC",
+                                   "<|content_invoke_tool_json|>","get_","weather","{\"name\":\"get_weather\",\"args\":{\"city\":",
+                                   "\"Paris\",\"unit\":\"c\"}}","{\"name\": oops","<|content_tool_error|>"};
     const std::string& word(int id) { return table.at(id); }
 };
 
@@ -40,11 +43,30 @@ int main() {
     assert(!request.messages[1].listed && request.messages[1].parts[0].text == "Hi");
     assert(thinking_effort(0.35) == "0.35" && thinking_effort(0) == "0" && thinking_effort("none") == "0");
 
+    // Tools: declared with sorted keys, earlier calls rendered as the template prints them, results labelled.
+    const Json tool = {{"type","function"},{"function",{{"name","get_weather"},{"parameters",{{"type","object"},{"properties",{{"city",{{"type","string"}}}}}}}}}};
+    const Json called = {{"role","assistant"},{"content",nullptr},{"tool_calls",Json::array({
+        {{"id","c1"},{"type","function"},{"function",{{"name","get_weather"},{"arguments","{\"unit\":\"c\",\"city\":\"Paris\",\"deep\":{\"z\":1,\"a\":2}}"}}}},
+        {{"id","c2"},{"type","function"},{"function",{{"name","ping"},{"arguments",""}}}},
+        {{"id","c3"},{"type","function"},{"function",{{"name","broken"},{"arguments","not json"}}}}})}};
+    request = parse_chat(body(Json::array({user("Weather?"),called,{{"role","tool"},{"tool_call_id","c1"},{"content","21"}},
+        {{"role","tool"},{"name","ping"},{"content",Json::array({text})}}}),{{"tools",Json::array({tool,{{"name","ping"}}})},{"tool_choice","auto"},{"parallel_tool_calls",true}}),"test");
+    assert(request.tools == "[{\"description\":\"\",\"name\":\"get_weather\",\"parameters\":{\"properties\":{\"city\":{\"type\":\"string\"}},\"type\":\"object\"},\"type\":\"function\"},"
+                            "{\"description\":\"\",\"name\":\"ping\",\"parameters\":{},\"type\":\"function\"}]");
+    assert(request.messages[1].calls.size() == 3 && request.messages[1].parts.empty());
+    assert(request.messages[1].calls[0].body == "{\"name\":\"get_weather\",\"args\":{\"city\":\"Paris\",\"deep\":{\"z\":1,\"a\":2},\"unit\":\"c\"}}");
+    assert(request.messages[1].calls[1].body == "{\"name\":\"ping\",\"args\":{}}");
+    assert(request.messages[1].calls[2].body == "{\"name\":\"broken\",\"args\":{\"arguments\":\"not json\"}}");
+    assert(request.messages[2].role == "tool" && request.messages[2].label == "get_weather" && request.messages[3].label == "ping");
+    assert(parse_chat(body(Json::array({user("x")}),{{"tools",Json::array({tool})},{"tool_choice","none"}}),"test").tools.empty());
+    assert(parse_chat(body(Json::array({user("x")}),{{"tools",Json::array()}}),"test").tools.empty());
+
     // Requests whose meaning cannot be honoured are refused, not silently altered.
-    const Json tool = {{"type","function"},{"function",{{"name","f"}}}};
     for (const auto& refused : {
-            body(Json::array({user("x")}),{{"tools",Json::array({tool})}}),
-            body(Json::array({user("x"),{{"role","tool"},{"content","1"}}})),
+            body(Json::array({user("x")}),{{"tools",Json::array({tool})},{"tool_choice","required"}}),
+            body(Json::array({user("x")}),{{"tools",Json::array({tool})},{"tool_choice",{{"type","function"},{"function",{{"name","get_weather"}}}}}}),
+            body(Json::array({user("x")}),{{"tools",Json::array({{{"type","function"},{"function",{{"description","nameless"}}}}})}}),
+            body(Json::array({user("x"),{{"role","assistant"},{"tool_calls",Json::array({{{"id","c"},{"function",{{"arguments","{}"}}}}})}}})),
             body(Json::array({user("x")}),{{"stop",Json::array({"END"})}}),
             body(Json::array({user("x")}),{{"n",2}}),
             body(Json::array({user("x")}),{{"response_format",{{"type","json_object"}}}}),
@@ -52,6 +74,7 @@ int main() {
             body(Json::array({user("x")}),{{"max_tokens",0}}),
             body(Json::array({user(Json::array({image,image}))})),
             body(Json::array({{{"role","assistant"},{"content",Json::array({image})}}})),
+            body(Json::array({{{"role","tool"},{"name","t"},{"content",Json::array({image})}}})),
             body(Json::array({user(Json::array({{{"type","image_url"},{"image_url",{{"url","https://example.com/a.png"}}}}}))})),
             body(Json::array()), std::string("[]")})
         assert(status_of(refused) == 400);
@@ -67,6 +90,24 @@ int main() {
     Splitter splitter;
     assert(splitter.feed(codec,0).empty() && splitter.feed(codec,4).empty() && splitter.channel == Splitter::answer);
     assert(splitter.feed(codec,5) == "answer" && splitter.feed(codec,6).empty() && splitter.finished);
+    assert(splitter.feed(codec,5).empty() && std::string(splitter.finish_reason()) == "stop"); // nothing after the end
+
+    // Tool calls: an answer, then a call spread over tokens, then a malformed one.
+    done = completion({0,4,5,3, 0,10,11,9,12,13,3, 0,10,11,9,14,3, 6},codec,"test",7,3);
+    const Json& message = done["choices"][0]["message"];
+    assert(done["choices"][0]["finish_reason"] == "tool_calls" && message["content"] == "answer" && message["tool_calls"].size() == 2);
+    assert(message["tool_calls"][0]["type"] == "function" && message["tool_calls"][0]["function"]["name"] == "get_weather");
+    assert(message["tool_calls"][0]["function"]["arguments"] == "{\"city\":\"Paris\",\"unit\":\"c\"}");
+    assert(message["tool_calls"][1]["function"]["name"] == "get_weather" && message["tool_calls"][1]["function"]["arguments"] == "{\"name\": oops");
+    assert(message["tool_calls"][0]["id"] != message["tool_calls"][1]["id"] && message["tool_calls"][0]["id"].get<std::string>().rfind("call_",0) == 0);
+    // A call with no answer has null content; a call cut off by the budget is still relayed, as "length".
+    done = completion({0,10,11,9,12,13,3,6},codec,"test",7,4);
+    assert(done["choices"][0]["message"]["content"].is_null() && done["choices"][0]["finish_reason"] == "tool_calls");
+    done = completion({0,10,11,9,12},codec,"test",7,5);
+    assert(done["choices"][0]["finish_reason"] == "length" && done["choices"][0]["message"]["tool_calls"].size() == 1);
+    // A content kind this server does not relay is dropped, not mixed into the answer.
+    done = completion({0,15,5,3,0,4,5,3,6},codec,"test",7,6);
+    assert(done["choices"][0]["message"]["content"] == "answer" && !done["choices"][0]["message"].contains("tool_calls"));
 
     // A character split across tokens is held back until it is whole.
     assert(complete_utf8("ok") == 2 && complete_utf8("ok\xE2\x82") == 2 && complete_utf8("ok\xE2\x82\xAC") == 5);
