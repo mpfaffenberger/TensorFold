@@ -1,0 +1,510 @@
+{
+ "transformers": "5.24.0.dev0",
+ "cases": [
+  {
+   "name": "single user turn",
+   "request": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "What is 2 + 2? Reply with just the number."
+     }
+    ]
+   },
+   "token_ids": [
+    200002,
+    200004,
+    34182,
+    279,
+    154554,
+    150628,
+    25,
+    220,
+    15,
+    200010,
+    200000,
+    200004,
+    1775,
+    149884,
+    220,
+    17,
+    196986,
+    220,
+    17,
+    30,
+    164896,
+    149899,
+    150239,
+    149876,
+    150107,
+    13,
+    200010
+   ]
+  },
+  {
+   "name": "system prompt then user",
+   "request": {
+    "messages": [
+     {
+      "role": "system",
+      "content": "You are terse."
+     },
+     {
+      "role": "user",
+      "content": "Name a prime."
+     }
+    ]
+   },
+   "token_ids": [
+    200002,
+    200004,
+    1735,
+    149914,
+    172044,
+    13,
+    200010,
+    200002,
+    200004,
+    34182,
+    279,
+    154554,
+    150628,
+    25,
+    220,
+    15,
+    200010,
+    200000,
+    200004,
+    1353,
+    149878,
+    152200,
+    13,
+    200010
+   ]
+  },
+  {
+   "name": "history with reasoning",
+   "request": {
+    "messages": [
+     {
+      "role": "system",
+      "content": "Be brief."
+     },
+     {
+      "role": "user",
+      "content": "Hi"
+     },
+     {
+      "role": "assistant",
+      "content": "Hello.",
+      "reasoning_content": "A greeting."
+     },
+     {
+      "role": "user",
+      "content": "And now?\nSecond line \u20ac \ud83d\ude00"
+     }
+    ]
+   },
+   "token_ids": [
+    200002,
+    200004,
+    1618,
+    156834,
+    13,
+    200010,
+    200002,
+    200004,
+    34182,
+    279,
+    154554,
+    150628,
+    25,
+    220,
+    15,
+    200010,
+    200000,
+    200004,
+    4896,
+    200010,
+    200001,
+    200008,
+    32,
+    195646,
+    279,
+    13,
+    200010,
+    200001,
+    200004,
+    32269,
+    13,
+    200010,
+    200006,
+    200000,
+    200004,
+    1790,
+    150386,
+    30,
+    198,
+    3975,
+    150264,
+    151091,
+    220,
+    110689,
+    200010
+   ]
+  },
+  {
+   "name": "assistant turn with reasoning and no answer",
+   "request": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "Think."
+     },
+     {
+      "role": "assistant",
+      "content": "",
+      "reasoning_content": "Done thinking."
+     },
+     {
+      "role": "user",
+      "content": "Well?"
+     }
+    ]
+   },
+   "token_ids": [
+    200002,
+    200004,
+    34182,
+    279,
+    154554,
+    150628,
+    25,
+    220,
+    15,
+    200010,
+    200000,
+    200004,
+    34182,
+    13,
+    200010,
+    200001,
+    200008,
+    35755,
+    154762,
+    13,
+    200010,
+    200006,
+    200000,
+    200004,
+    4703,
+    30,
+    200010
+   ]
+  },
+  {
+   "name": "assistant turn without content",
+   "request": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "a"
+     },
+     {
+      "role": "assistant",
+      "content": null
+     },
+     {
+      "role": "user",
+      "content": "b"
+     }
+    ]
+   },
+   "token_ids": [
+    200002,
+    200004,
+    34182,
+    279,
+    154554,
+    150628,
+    25,
+    220,
+    15,
+    200010,
+    200000,
+    200004,
+    64,
+    200010,
+    200006,
+    200000,
+    200004,
+    65,
+    200010
+   ]
+  },
+  {
+   "name": "text part list",
+   "request": {
+    "messages": [
+     {
+      "role": "user",
+      "content": [
+       {
+        "type": "text",
+        "text": "first"
+       },
+       {
+        "type": "text",
+        "text": ""
+       },
+       {
+        "type": "text",
+        "text": "third"
+       }
+      ]
+     }
+    ]
+   },
+   "token_ids": [
+    200002,
+    200004,
+    34182,
+    279,
+    154554,
+    150628,
+    25,
+    220,
+    15,
+    200010,
+    200000,
+    200004,
+    1276,
+    200010,
+    200000,
+    200004,
+    200010,
+    200000,
+    200004,
+    2643,
+    200010
+   ]
+  },
+  {
+   "name": "image then text",
+   "request": {
+    "messages": [
+     {
+      "role": "user",
+      "content": [
+       {
+        "type": "image_url",
+        "image_url": {
+         "url": "data:image/png;base64,AQI="
+        }
+       },
+       {
+        "type": "text",
+        "text": "What colour is this?"
+       }
+      ]
+     }
+    ]
+   },
+   "token_ids": [
+    200002,
+    200004,
+    34182,
+    279,
+    154554,
+    150628,
+    25,
+    220,
+    15,
+    200010,
+    200000,
+    200005,
+    200054,
+    200010,
+    200000,
+    200004,
+    1775,
+    161575,
+    149884,
+    149928,
+    30,
+    200010
+   ]
+  },
+  {
+   "name": "system message only",
+   "request": {
+    "messages": [
+     {
+      "role": "system",
+      "content": "Only instructions."
+     }
+    ]
+   },
+   "token_ids": [
+    200002,
+    200004,
+    74790,
+    157823,
+    13,
+    200010,
+    200002,
+    200004,
+    34182,
+    279,
+    154554,
+    150628,
+    25,
+    220,
+    15,
+    200010
+   ]
+  },
+  {
+   "name": "two system messages",
+   "request": {
+    "messages": [
+     {
+      "role": "system",
+      "content": "One."
+     },
+     {
+      "role": "system",
+      "content": "Two."
+     },
+     {
+      "role": "user",
+      "content": "Go."
+     }
+    ]
+   },
+   "token_ids": [
+    200002,
+    200004,
+    2603,
+    13,
+    200010,
+    200002,
+    200004,
+    4348,
+    13,
+    200010,
+    200002,
+    200004,
+    34182,
+    279,
+    154554,
+    150628,
+    25,
+    220,
+    15,
+    200010,
+    200000,
+    200004,
+    1932,
+    13,
+    200010
+   ]
+  },
+  {
+   "name": "named effort",
+   "request": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "Explain gravity."
+     }
+    ],
+    "reasoning_effort": "high"
+   },
+   "token_ids": [
+    200002,
+    200004,
+    34182,
+    279,
+    154554,
+    150628,
+    25,
+    220,
+    15,
+    13,
+    24,
+    200010,
+    200000,
+    200004,
+    100887,
+    170127,
+    13,
+    200010
+   ]
+  },
+  {
+   "name": "numeric effort",
+   "request": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "Explain gravity."
+     }
+    ],
+    "reasoning_effort": 0.35
+   },
+   "token_ids": [
+    200002,
+    200004,
+    34182,
+    279,
+    154554,
+    150628,
+    25,
+    220,
+    15,
+    13,
+    68337,
+    200010,
+    200000,
+    200004,
+    100887,
+    170127,
+    13,
+    200010
+   ]
+  },
+  {
+   "name": "minimal effort",
+   "request": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "Explain gravity."
+     }
+    ],
+    "reasoning_effort": "minimal"
+   },
+   "token_ids": [
+    200002,
+    200004,
+    34182,
+    279,
+    154554,
+    150628,
+    25,
+    220,
+    15,
+    13,
+    16,
+    200010,
+    200000,
+    200004,
+    100887,
+    170127,
+    13,
+    200010
+   ]
+  }
+ ]
+}

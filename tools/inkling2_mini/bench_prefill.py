@@ -6,16 +6,20 @@ to a handful of experts and makes the expert path look faster than it is.
 import argparse
 import http.client
 import json
+import os
 import time
 
 
-def run(port, prompt, output_budget):
+def run(port, prompt, output_budget, api_key=os.environ.get('TENSORFOLD_API_KEY', '')):
     client = http.client.HTTPConnection('127.0.0.1', port, timeout=3600)
     body = json.dumps({'model': 'inkling', 'messages': [{'role': 'user', 'content': prompt}],
                        'max_tokens': output_budget})
     try:
         start = time.monotonic()
-        client.request('POST', '/v1/chat/completions', body, {'Content-Type': 'application/json'})
+        headers = {'Content-Type': 'application/json'}
+        if api_key:
+            headers['Authorization'] = f'Bearer {api_key}'
+        client.request('POST', '/v1/chat/completions', body, headers)
         response = client.getresponse()
         reply = json.load(response)
         elapsed = time.monotonic() - start

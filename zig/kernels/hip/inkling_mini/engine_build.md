@@ -45,19 +45,48 @@ The direct HIP build is the one exercised on the Radeon 8060S. The CLI performs
 single-turn, batch-one greedy decoding and prints protocol tokens as generated.
 Set `TF_INKLING_TOKEN_IDS=1` for decimal IDs. This binary runs independently of Python, PyTorch and vLLM.
 
-## Resident loopback server
+## Chat server
 
 ```sh
 zig build -Dhip=true native-hip tf-inkling-hip
 zig-out/native-hip/bin/tensorfold-native serve /path/to/Inkling-2-Mini \
   --backend rocm --host 127.0.0.1 --port 18465 --name inkling \
-  --context 16384 --max-tokens 512 --vision
+  --context 16384 --max-tokens 4096 --vision
 ```
 
 GET `/health` or `/v1/models`; POST `/v1/chat/completions`. One resident engine
-handles one single-user, non-streaming greedy request at a time. `content` is
-the final answer and `reasoning_content` is separate. One optional image comes
-first in the message content array, then text:
+serves one request at a time, in arrival order; a long request holds the server
+until it finishes or its client hangs up.
+
+**Where it listens.** On loopback the server is open and refuses `Host`
+headers that name another machine. Any other `--host` (an IPv4 address, or
+`0.0.0.0`) requires `TENSORFOLD_API_KEY` in the environment, and every route
+except `/health` then needs `Authorization: Bearer <key>`. A reverse proxy
+running in a container reaches the host through a non-loopback address, so it
+needs this mode.
+
+**Conversations** are rendered with the checkpoint's own chat template:
+`system` (or `developer`), `user` and `assistant` turns, text parts, an earlier
+turn's `reasoning_content`, and one image. `chat_template_test.cpp` checks the
+rendering token for token against
+`tools/inkling2_mini/chat-template-reference.json`, which
+`make_chat_template_reference.py` records from the pinned Transformers
+tokenizer. `reasoning_effort` takes `none`, `minimal`, `low`, `medium`, `high`,
+`xhigh`, `max` or a number from 0 to 0.99. The server's default is `none`; the
+template's own default is `high`, which spends far more tokens thinking.
+
+**Responses.** `content` is the answer and `reasoning_content` the thinking.
+`"stream": true` returns server-sent events, with a usage event when
+`stream_options.include_usage` is set. `usage` is always in a plain reply.
+`max_tokens` above the server's cap or the remaining context is clamped.
+
+**Greedy only.** `temperature`, `top_p`, `seed` and other sampling options are
+accepted and ignored, because ordinary clients always send them. Requests that
+cannot be honoured are refused with 400: `tools` and tool messages, `stop`
+sequences, JSON `response_format`, `n` above 1, a second image, and images that
+are not inline PNG.
+
+One optional image goes in a user message's content array:
 
 ```json
 [{"type":"image_url","image_url":{"url":"data:image/png;base64,..."}},
@@ -69,8 +98,7 @@ merged visual tokens (`ceil(width/40) * ceil(height/40)`). The decoder does
 not fetch remote URLs, accept JPEGs, or silently downsample oversized images.
 Total context includes the template, visual tokens and requested output. The
 limit is 16,384, **not** the checkpoint's advertised 1M. The JSON body cap is
-8 MiB, including base64; text is capped at 32 KiB. Long requests occupy the
-server until completion.
+8 MiB, including base64; message text is capped at 256 KiB.
 
 ## Speed, and what bounds it
 
@@ -133,9 +161,15 @@ hipcc -std=c++17 -O2 --offload-arch=gfx1151 batch_test.hip -lhipblas -o batch-te
 ./batch-test /path/to/Inkling-2-Mini     # batched operators vs scalar kernels
 hipcc -std=c++17 -O2 --offload-arch=gfx1151 context_test.hip -o context-test
 ./context-test /path/to/Inkling-2-Mini   # cache windows, log scaling, admission
-python tools/inkling2_mini/serve_smoke.py --port 18465
+c++ -std=c++17 serve_test.cpp -o serve-test && ./serve-test   # request parsing, no GPU
+c++ -std=c++17 chat_template_test.cpp -lpcre2-8 -o chat-template-test
+./chat-template-test /path/to/Inkling-2-Mini ../../../../tools/inkling2_mini/chat-template-reference.json
+python tools/inkling2_mini/serve_smoke.py --port 18465        # image and text answers
+python tools/inkling2_mini/serve_chat_check.py --port 18465   # history, streaming, refusals
 python tools/inkling2_mini/bench_prefill.py --port 18465 --document some.txt --max-tokens 1
 ```
+
+The three Python checks read `TENSORFOLD_API_KEY` or take `--api-key`.
 
 `batch-test` requires each batched operator to agree with its scalar kernel to
 BF16 rounding noise (relative RMS under 2e-3) and scalar decode to continue
