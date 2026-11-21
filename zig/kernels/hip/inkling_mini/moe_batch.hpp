@@ -1,140 +1,92 @@
 #pragma once
 #include "moe.hpp"
+#include "dense.hpp"
 
+// Batched MoE for prefill. (token,slot) pairs are grouped by expert. A busy
+// expert is dequantized once into FP32 scratch and applied with one GEMM per
+// projection; an expert with only a few rows reads the packed weights directly,
+// because dequantizing 8M weights for a handful of rows costs more than it saves.
+// Routing, activation and mixing are the scalar kernels of moe.hpp over more rows.
 namespace inkling_moe_batch {
 using namespace inkling_moe;
-constexpr int Tile = 4, Chunk = 128;
+// Rows per expert from which dequantize+GEMM is used. Prefill time was flat
+// (within run-to-run noise) for 6..32 and slower at 48, on 150 to 5,000 token prompts.
+constexpr int dense_rows = 12;
 
-static __global__ void route(const float* w, const float* x, float* scores) {
-    int t = blockIdx.y, lane = threadIdx.x % 32, row = blockIdx.x * 4 + threadIdx.x / 32;
-    float v = 0.f;
-    for (int c = lane; c < H; c += 32) v = fmaf(w[row*H+c], x[t*H+c], v);
-    v = sum32(v);
-    if (!lane) scores[t*N+row] = 1.f / (1.f + expf(-v));
-}
-
-static __global__ void choose(const float* scores, const float* bias, float* ids, float* mix) {
-    int t = blockIdx.x;
-    scores += t*N;
-    int best[K] = {};
-    float ranks[K];
-    for (int j = 0; j < K; ++j) ranks[j] = -INFINITY;
-    for (int i = 0; i < N; ++i) {
-        float rank = scores[i] + bias[i];
-        int j = K - 1;
-        if (rank <= ranks[j]) continue;
-        while (j && rank > ranks[j-1]) {
-            best[j] = best[j-1]; ranks[j] = ranks[j-1]; --j;
-        }
-        best[j] = i; ranks[j] = rank;
-    }
-    float total = 0.f;
-    for (int j = 0; j < K; ++j) total += scores[best[j]];
-    for (int j = 0; j < K; ++j) {
-        int pos = 0;
-        for (int i = 0; i < K; ++i) pos += best[i] < best[j];
-        ids[t*K+pos] = float(best[j]);
-        mix[t*K+pos] = (scores[best[j]] / (total + 1e-20f)) * 8.f;
-    }
-}
-
-// One block constructs a compact tile schedule on device. Routing selects an
-// expert at most once per token, so its list needs at most B original slots.
-static __global__ void schedule(const float* ids, int B, int* slots, int* tasks) {
-    __shared__ int offsets[N+1];
-    int e = threadIdx.x, count = 0;
-    for (int i = 0; i < B*K; ++i)
-        if (int(ids[i]) == e) slots[e*B + count++] = i;
-    offsets[e+1] = (count+Tile-1)/Tile;
+// One block, one thread per expert. order[r] is the pair at sorted rank r.
+static __global__ void group_pairs(const int* ids, int pairs, int* counts, int* order, int* rank) {
+    __shared__ int offsets[N];
+    int expert = threadIdx.x, count = 0;
+    for (int i = 0; i < pairs; ++i) count += ids[i] == expert;
+    counts[expert] = offsets[expert] = count;
     __syncthreads();
-    if (!e) {
-        offsets[0] = 0;
-        for (int i = 0; i < N; ++i) offsets[i+1] += offsets[i];
-        tasks[0] = offsets[N];
+    if (!expert) {
+        int total = 0;
+        for (int i = 0; i < N; ++i) { int own = offsets[i]; offsets[i] = total; total += own; }
     }
     __syncthreads();
-    for (int i = 0; i < count; i += Tile) {
-        int* task = tasks + 1 + 3*(offsets[e]+i/Tile);
-        task[0] = e; task[1] = e*B+i; task[2] = min(Tile,count-i);
-    }
+    int at = offsets[expert];
+    for (int i = 0; i < pairs; ++i)
+        if (ids[i] == expert) { order[at] = i; rank[i] = at++; }
+}
+static __global__ void gather_rows(const float* x, const int* order, float* out) {
+    int i = blockIdx.x*blockDim.x + threadIdx.x;
+    out[size_t(blockIdx.y)*H+i] = x[size_t(order[blockIdx.y]/K)*H+i];
 }
 
-template<bool NV, bool Down>
-static __global__ void grouped(Packed p, const int* tasks, const int* slots,
-                               const float* input, float* output) {
-    if (blockIdx.y >= tasks[0]) return;
-    const int* task = tasks + 1 + 3*blockIdx.y;
-    int expert = task[0], n = task[2];
-    int row = blockIdx.x*4 + threadIdx.x/32, lane = threadIdx.x%32;
+// One expert's BF16 weights as FP32, for a GEMM. One thread per 32-bit load.
+template<bool NV>
+static __global__ void dequantize(Packed p, int expert, int cols, float* out) {
+    int local = (blockIdx.x*blockDim.x + threadIdx.x)*group<NV>;
+    if (local < H*cols) unpack<NV>(p,expert*H*cols + local,outer_scale<NV>(p,expert),out+local);
+}
+
+template<bool Down>
+inline void apply_experts(Packed p, bool nv, const int* counts, const float* in, float* out, float* weight) {
     constexpr int cols = Down ? F : H;
-    int base = (expert*H + row)*cols;
-    float factor = NV ? bf(p.amax[expert]) / bf(p.denom[0]) : 1.f;
-    int slot[Tile] = {};
-    float sum[Tile] = {};
-    #pragma unroll
-    for (int j = 0; j < Tile; ++j)
-        if (j < n) slot[j] = slots[task[1]+j];
-    for (int c = lane; c < cols; c += 32) {
-        int i = base+c;
-        float w;
-        if (NV) {
-            unsigned byte = p.w[i/2];
-            w = e2m1((byte >> ((i&1)*4)) & 15) * e4m3(p.scale[i/16]);
-            w *= factor;
+    for (int expert = 0, at = 0; expert < N; at += counts[expert++]) {
+        const int count = counts[expert];
+        if (!count) continue;
+        const float* rows = in + size_t(at)*cols;
+        float* result = out + size_t(at)*H;
+        if (count < dense_rows) {
+            launch_project<Down>(nv,p,nullptr,expert,rows,cols,result,count);
         } else {
-            w = e4m3(p.w[i]) * exp2f(float(p.scale[i/32])-127.f);
-        }
-        w = bf(w);
-        #pragma unroll
-        for (int j = 0; j < Tile; ++j) if (j < n) {
-            int src = Down ? slot[j] : slot[j]/K;
-            sum[j] = fmaf(w, input[src*cols+c], sum[j]);
+            const unsigned loads = H*cols/(nv ? group<true> : group<false>);
+            if (nv) dequantize<true><<<loads/256,256>>>(p,expert,cols,weight);
+            else dequantize<false><<<loads/256,256>>>(p,expert,cols,weight);
+            mini_dense::linear(weight,rows,result,count,cols,H);
         }
     }
-    #pragma unroll
-    for (int j = 0; j < Tile; ++j) if (j < n) {
-        float v = sum32(sum[j]);
-        if (!lane) output[slot[j]*H+row] = bf(v);
-    }
-}
-
-static __global__ void finish(const float* down, const float* mix, float* out) {
-    int t = blockIdx.y, row = blockIdx.x*blockDim.x + threadIdx.x;
-    if (row >= H) return;
-    float v = 0.f;
-    for (int j = 0; j < K; ++j) v += __fmul_rn(down[(t*K+j)*H+row], mix[t*K+j]);
-    out[t*H+row] = bf(v);
 }
 } // namespace inkling_moe_batch
 
+// x and y are B contiguous rows. Same routing, rounding points and expert
+// mixing order as moe(); dot products inside a GEMM are reassociated.
 inline void moe_batch(Engine& e, int layer, const float* x, float* y, int B) {
     using namespace inkling_moe_batch;
     if (B <= 0) return;
-    if (B == 1) return moe(e, layer, x, y);
-    std::string key = "model.llm.layers." + std::to_string(layer) + ".mlp.";
-    bool nv = layer < 20;
+    const std::string key = "model.llm.layers." + std::to_string(layer) + ".mlp.";
+    const bool nv = layer < 20; // physical checkpoint layer, not loop visit
     auto w13 = load(e,key+"experts.w13_weight",nv), w2 = load(e,key+"experts.w2_weight",nv);
-    auto gate = e.w(key+"gate.weight"), bias = e.w(key+"gate.bias");
-    int cap = std::min(B,Chunk);
-    auto scores = e.tmp("moeb_scores",cap*N), ids = e.tmp("moeb_ids",cap*K);
-    auto mix = e.tmp("moeb_mix",cap*K), gu = e.tmp("moeb_projected",cap*K*H);
-    auto hidden = e.tmp("moeb_hidden",cap*K*F);
+    const int pairs = B*K;
+    auto tmp = [&](const char* name, size_t count){ return e.tmp(std::string("moe_batch.")+name,count); };
     static_assert(sizeof(int) == sizeof(float), "scratch capacity is in floats");
-    auto slots = reinterpret_cast<int*>(e.tmp("moeb_slots",cap*N));
-    auto tasks = reinterpret_cast<int*>(e.tmp("moeb_tasks",1+3*cap*K));
-    while (B) {
-        int b = std::min(B,cap);
-        route<<<dim3(N/4,b),128>>>(gate,x,scores);
-        choose<<<b,1>>>(scores,bias,ids,mix);
-        schedule<<<1,N>>>(ids,b,slots,tasks);
-        // At most Tile-1 padding entries per expert; no host count readback.
-        dim3 grid(H/4,std::min(b*K,(b*K+N*(Tile-1))/Tile));
-        if (nv) grouped<true,false><<<grid,128>>>(w13,tasks,slots,x,gu);
-        else grouped<false,false><<<grid,128>>>(w13,tasks,slots,x,gu);
-        activate<<<dim3((F+127)/128,b*K),128>>>(gu,hidden);
-        if (nv) grouped<true,true><<<grid,128>>>(w2,tasks,slots,hidden,gu);
-        else grouped<false,true><<<grid,128>>>(w2,tasks,slots,hidden,gu);
-        finish<<<dim3((H+127)/128,b),128>>>(gu,mix,y);
-        x += b*H; y += b*H; B -= b;
-    }
+    auto ints = [&](const char* name, size_t count){ return reinterpret_cast<int*>(tmp(name,count)); };
+    float* logits = tmp("logits",size_t(B)*N), *mix = tmp("mix",pairs);
+    int* ids = ints("ids",pairs), *order = ints("order",pairs), *rank = ints("rank",pairs), *counts = ints("counts",N);
+    float* inputs = tmp("inputs",size_t(pairs)*H), *projected = tmp("projected",size_t(pairs)*H);
+    float* hidden = tmp("hidden",size_t(pairs)*F), *weight = tmp("weight",size_t(H)*H);
+
+    mini_dense::linear(e.w(key+"gate.weight"),x,logits,B,H,N); // the router stays FP32, unrounded
+    select<<<B,N>>>(logits,e.w(key+"gate.bias"),ids,mix);
+    group_pairs<<<1,N>>>(ids,pairs,counts,order,rank);
+    gather_rows<<<dim3(H/256,pairs),256>>>(x,order,inputs);
+    int host_counts[N];
+    INKLING_HIP_CHECK(hipMemcpy(host_counts,counts,sizeof(host_counts),hipMemcpyDeviceToHost));
+    apply_experts<false>(w13,nv,host_counts,inputs,projected,weight);
+    activate<<<dim3(F/128,pairs),128>>>(projected,hidden);
+    apply_experts<true>(w2,nv,host_counts,hidden,projected,weight); // `projected` now holds down rows
+    combine<<<dim3(H/128,B),128>>>(projected,mix,rank,y);
+    INKLING_HIP_CHECK(hipGetLastError());
 }

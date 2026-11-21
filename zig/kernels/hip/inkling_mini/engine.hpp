@@ -49,13 +49,19 @@ inline void upload_floats(const Tensor& tensor, float* out) {
     }
 }
 
-static __global__ void matvec(const float* weight, const float* x, float* y, int cols) {
+// A BF16 word is the high half of the FP32 value Engine::w expands it to, so
+// both instantiations of matvec perform identical arithmetic.
+__device__ inline float widen(float word) { return word; }
+__device__ inline float widen(uint16_t word) { return __uint_as_float(uint32_t(word) << 16); }
+
+template<class Word>
+static __global__ void matvec(const Word* weight, const float* x, float* y, int cols) {
     constexpr int lanes = 256;
     __shared__ float sums[lanes];
     const auto t = threadIdx.x;
     float sum = 0;
     for (size_t i = t; i < size_t(cols); i += lanes)
-        sum = fmaf(weight[size_t(blockIdx.x)*cols+i], x[i], sum);
+        sum = fmaf(widen(weight[size_t(blockIdx.x)*cols+i]), x[i], sum);
     sums[t] = sum;
     __syncthreads();
     for (int stride = lanes/2; stride; stride /= 2) {
@@ -87,15 +93,29 @@ public:
         auto it = scratch.find(name);
         return it == scratch.end() ? 0 : it->second.capacity;
     }
+    // Decode reads these large BF16 matrices once per token and is bound by
+    // memory bandwidth, so it streams them in checkpoint form (see half()).
+    static bool streamed(const std::string& key) {
+        for (const char* suffix : {".attn.wq_du.weight", ".attn.wr_du.weight", ".attn.wk_dv.weight",
+                                   ".attn.wv_dv.weight", ".attn.gate_attn.weight", ".attn.wo_ud.weight",
+                                   ".llm.unembed.weight"}) {
+            const size_t length = std::strlen(suffix);
+            if (key.size() >= length && !key.compare(key.size()-length,length,suffix)) return true;
+        }
+        return false;
+    }
     // The Mini checkpoint uses U8/F8 only for packed expert weights/scales.
-    // Budget every other tensor expanded, including the visual encoder. Check
-    // the expected representation: raw and expanded caches are independent.
+    // Budget every other tensor expanded, including the visual encoder, plus a
+    // verbatim copy of each streamed matrix. Only the unembedding is never
+    // expanded: batched prefill needs FP32 attention weights for its GEMMs.
     size_t missing_weight_bytes() const {
         size_t bytes = 0;
         for (const auto& [key,t] : checkpoint.entries()) {
-            bool raw = t.type == mini_engine::Type::u8 || t.type == mini_engine::Type::e4m3;
-            if (!(raw ? packed : weights).count(key))
-                bytes += raw ? t.bytes : mini_engine::product(t.count,sizeof(float));
+            const bool quantized = t.type == mini_engine::Type::u8 || t.type == mini_engine::Type::e4m3;
+            const bool verbatim = quantized || (t.type == mini_engine::Type::bf16 && streamed(key));
+            const bool expanded = !quantized && key != "model.llm.unembed.weight";
+            if (verbatim && !packed.count(key)) bytes += t.bytes;
+            if (expanded && !weights.count(key)) bytes += mini_engine::product(t.count,sizeof(float));
         }
         return bytes;
     }
@@ -141,11 +161,19 @@ public:
         }
         return it->second.get();
     }
-    void mv(const float* weight, const float* x, float* y, int rows, int cols) {
+    // Checkpoint-form BF16 words of a streamed matrix, for mv().
+    const uint16_t* half(const std::string& full_tensor_key) {
+        mini_engine::require(checkpoint.get(full_tensor_key).type == mini_engine::Type::bf16 && streamed(full_tensor_key),
+                             "not a streamed BF16 matrix: " + full_tensor_key);
+        return static_cast<const uint16_t*>(raw(full_tensor_key));
+    }
+    // Word is float (expanded weights) or uint16_t (BF16 words from half()).
+    template<class Word>
+    void mv(const Word* weight, const float* x, float* y, int rows, int cols) {
         mini_engine::require(rows >= 0 && cols >= 0, "negative matvec dimension");
         if (!rows) return;
         mini_engine::require(y && (!cols || (weight && x)), "null matvec operand");
-        mini_engine::matvec<<<rows,256>>>(weight,x,y,cols);
+        mini_engine::matvec<Word><<<rows,256>>>(weight,x,y,cols);
         INKLING_HIP_CHECK(hipGetLastError());
     }
 };

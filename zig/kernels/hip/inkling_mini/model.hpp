@@ -93,7 +93,7 @@ inline int step(Engine& e, int token, int pos, const float* image_row=nullptr) {
     retrieve<<<1,T>>>(states, n+1, e.w(ar+"output_query"), input);
     rms<<<1,T>>>(input, e.w(root+"norm.weight"), norm, true);
     float* logits = tmp("logits", vocab);
-    e.mv(e.w(root+"unembed.weight"), norm, logits, vocab, H);
+    e.mv(e.half(root+"unembed.weight"), norm, logits, vocab, H);
     int* device_id = reinterpret_cast<int*>(tmp("id", 1));
     greedy<<<1,T>>>(logits, device_id);
     check(hipGetLastError());

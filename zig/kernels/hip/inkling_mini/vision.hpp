@@ -1,29 +1,16 @@
 #pragma once
 #include "vision_ops.hpp"
 #include "vision_png.hpp"
-#include <hipblas/hipblas.h>
-
-namespace mini_vision {
-struct Blas {
-    hipblasHandle_t h;
-    Blas() { check(hipblasCreate(&h)==HIPBLAS_STATUS_SUCCESS,"vision hipBLAS init failed"); }
-    ~Blas() { hipblasDestroy(h); }
-    Blas(const Blas&)=delete;
-};
-}
+#include "dense.hpp"
 
 // One encoded image per call. Returns contiguous host rows [ceil(H/40)*ceil(W/40),2304].
 inline std::vector<float> inkling_project(Engine& e,const mini_vision::ImagePatches& image) {
     using namespace mini_vision;
     int tiles=image.rows*image.cols, n=4*tiles+1;
-    Blas blas;
     auto tmp=[&](std::string key,int count){return e.tmp("vision."+key,count);};
     auto weight=[&](std::string key){return e.w("model.visual."+key);};
     auto linear=[&](std::string key,const float* x,float* y,int rows,int in,int out,bool bias,bool gelu=false){
-        const float alpha=1,beta=0;
-        // Row-major Y = X W^T, presented to column-major BLAS as Y^T = W X^T.
-        check(hipblasSgemm(blas.h,HIPBLAS_OP_T,HIPBLAS_OP_N,out,rows,in,&alpha,
-              weight(key+".weight"),in,x,in,&beta,y,out)==HIPBLAS_STATUS_SUCCESS,"vision GEMM failed");
+        mini_dense::linear(weight(key+".weight"),x,y,rows,in,out);
         if(bias||gelu) activate<<<(rows*out+255)/256,256>>>(y,bias?weight(key+".bias"):nullptr,out,rows*out,gelu);
     };
     auto ln=[&](std::string key,const float* x,float* y){

@@ -42,8 +42,9 @@ inline void check_budget(size_t need, size_t avail) {
 // image patches and decode. Existing allocations already reduce free device RAM.
 // Reserve 1 GiB for directories, small model/vision workspaces, HIP allocator
 // granularity and other activity. Snapshot, not an allocation guarantee.
-inline void inkling_admit(Engine& e, size_t positions) {
-    size_t need = inkling_context::missing_bytes(e,positions), avail, total;
+// scratch_bytes is working memory the request will allocate beyond weights and caches.
+inline void inkling_admit(Engine& e, size_t positions, size_t scratch_bytes = 0) {
+    size_t need = inkling_context::missing_bytes(e,positions) + scratch_bytes, avail, total;
     INKLING_HIP_CHECK(hipMemGetInfo(&avail,&total));
     inkling_context::check_budget(need,avail);
 }

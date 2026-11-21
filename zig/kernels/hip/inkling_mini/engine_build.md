@@ -68,9 +68,75 @@ Supply non-interlaced 8-bit PNG (gray, gray+alpha, RGB or RGBA), up to 256
 merged visual tokens (`ceil(width/40) * ceil(height/40)`). The decoder does
 not fetch remote URLs, accept JPEGs, or silently downsample oversized images.
 Total context includes the template, visual tokens and requested output. The
-limit is 16,384, **not** the checkpoint's advertised 1M. Prefill processes 32-token
-chunks through all 48 visits and projects only the final prompt position to logits.
-Generation after the first token still uses the scalar decoder. Set
-`TF_INKLING_TIMINGS=1` on the server process to log prefill time (including lazy
-weight uploads on a cold engine) separately from subsequent-token decode time. The JSON body cap is 8 MiB, including base64; text is capped
-at 32 KiB. Long requests occupy the server until completion.
+limit is 16,384, **not** the checkpoint's advertised 1M. The JSON body cap is
+8 MiB, including base64; text is capped at 32 KiB. Long requests occupy the
+server until completion.
+
+## Speed, and what bounds it
+
+Measured warm on a Radeon 8060S (gfx1151) through the loopback server, real
+English text, one request at a time:
+
+| Prompt tokens | Prefill | Rate |
+|---|---|---|
+| 151 | 1.7 s | 91 tok/s |
+| 423 | 3.3 s | 130 tok/s |
+| 1,416 | 7.8 s | 182 tok/s |
+| 4,987 | 23.1 s | 216 tok/s |
+| 9,590 | 43.8 s | 219 tok/s |
+
+Decode is 17 tok/s at short context and 14 tok/s at 9.6K positions. The last
+two prefill rows used `TF_INKLING_PREFILL_CHUNK=16384`; the default of 4096 is
+about 10% slower beyond 4K tokens and needs a third of the scratch memory.
+
+Every token passes 48 layer visits (the 12 middle layers run three times) and
+eight experts per visit: about 4.3 billion weight multiplies per prompt token,
+and 4.8 billion per generated token with the unembedding.
+
+* **Prefill is bound by GEMM throughput.** Projections, expert rows and
+  attention scores are hipBLAS SGEMMs. `rocBLAS` peaks near 2.7 TFLOP/s on
+  this GPU and a token costs 8.7 GFLOP, a ceiling near 310 tok/s. Expert
+  weights are dequantized to FP32 scratch once per chunk and layer visit,
+  which is why short prompts are slower per token.
+* **Decode is bound by memory traffic.** One token must read about 5.5 GB of
+  weights: BF16 attention and unembedding matrices and packed experts, all in
+  checkpoint form. The unembedding streams at roughly 175 GB/s, which would
+  allow about 30 tok/s if every kernel streamed that well.
+
+`TF_INKLING_TIMINGS=1` logs prefill and decode time per request (prefill
+includes lazy weight uploads on a cold engine). `TF_INKLING_PROFILE=1` splits
+prefill into attention, experts and the rest; it synchronizes the device at
+stage boundaries, so a profiled run is slower.
+
+## Numerical behaviour
+
+`TF_INKLING_PREFILL_CHUNK=0` evaluates the prompt one token at a time with the
+decode kernels. That path reproduces both traces in
+`tools/inkling2_mini/gfx1151-reference.json` token for token and is the
+oracle for the batched path.
+
+The batched prefill keeps the same rounding points but its GEMMs sum in a
+different order, so it is **not** bit-identical. This model rounds to BF16
+after every operator and amplifies such differences: summing the scalar
+matvec in 128 lanes instead of 256, a mathematically identical change, moves
+the post-prefill logits by an RMS of 1.7 against a logit RMS of 17.9. The
+batched path moves them by 1.5. Greedy output can therefore differ from the
+reference traces wherever two tokens are nearly tied; one build of this path
+diverged at the sixth generated token of the first trace and still answered
+`4`. Decode attention sums cached keys in segments of 256, which is exact up
+to 256 positions and reassociated beyond.
+
+Checks, all on a real device with the original checkpoint:
+
+```sh
+hipcc -std=c++17 -O2 --offload-arch=gfx1151 batch_test.hip -lhipblas -o batch-test
+./batch-test /path/to/Inkling-2-Mini     # batched operators vs scalar kernels
+hipcc -std=c++17 -O2 --offload-arch=gfx1151 context_test.hip -o context-test
+./context-test /path/to/Inkling-2-Mini   # cache windows, log scaling, admission
+python tools/inkling2_mini/serve_smoke.py --port 18465
+python tools/inkling2_mini/bench_prefill.py --port 18465 --document some.txt --max-tokens 1
+```
+
+`batch-test` requires each batched operator to agree with its scalar kernel to
+BF16 rounding noise (relative RMS under 2e-3) and scalar decode to continue
+from the caches a batched prefill leaves behind.

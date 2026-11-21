@@ -129,14 +129,26 @@ static __global__ void attn_softmax(float** pages, int capacity, int first, int 
     }
 }
 
-static __global__ void attn_mix(float** pages, int capacity, int first, int pos,
-                                const float* gate, float* y) {
-    int h = blockIdx.x, d = threadIdx.x, i = h*128+d;
+// P.V in two steps, because one thread walking every cached key serially cost
+// 37 ms per decoded token at 9.6K positions. Each block sums one segment of
+// keys in order; attn_mix_finish then adds the segments in order. Up to
+// attn_segment keys that is one segment and exactly the single sequential sum
+// the reference traces were recorded with; beyond it the sum is reassociated.
+static constexpr int attn_segment = 256;
+static __global__ void attn_mix(float** pages, int capacity, int first, int pos, float* partial) {
+    int h = blockIdx.x, d = threadIdx.x;
+    int begin = first+blockIdx.y*attn_segment, end = min(pos,begin+attn_segment-1);
     float sum = 0.f;
-    for (int t = first; t <= pos; ++t) {
+    for (int t = begin; t <= end; ++t) {
         float* page = pages[(t/attn_page)%capacity];
         sum += *attn_score_ptr(page,h,t)*attn_read(page,(attn_page+t%attn_page)*attn_kv+(h/3)*128+d);
     }
+    partial[(blockIdx.y*24+h)*128+d] = sum;
+}
+static __global__ void attn_mix_finish(const float* partial, int segments, const float* gate, float* y) {
+    int i = blockIdx.x*128+threadIdx.x;
+    float sum = partial[i];
+    for (int s = 1; s < segments; ++s) sum += partial[s*3072+i];
     y[i] = attn_bf(attn_bf(sum)*(1.f/(1.f+expf(-gate[i]))));
 }
 
@@ -158,18 +170,19 @@ inline void attn_forward_qkv(Engine& e, int layer, int visit, int pos, const flo
     const std::string base = "model.llm.layers."+std::to_string(layer)+".";
     const std::string state = inkling_context::state(layer,visit);
     auto w = [&](const std::string& key){ return e.w(base+"attn."+key); };
+    auto half = [&](const std::string& key){ return e.half(base+"attn."+key); }; // large matrices, streamed as BF16
     auto tmp = [&](const std::string& key, size_t n){ return e.tmp("attn_work."+key,n); };
     const float tau = inkling_context::tau(full,pos);
     float* q = tmp("q",3072), *rel = tmp("rel",384);
-    e.mv(w("wq_du.weight"),x,q,3072,2304);
+    e.mv(half("wq_du.weight"),x,q,3072,2304);
     attn_norm<<<24,128>>>(q,w("q_l2_clip.scale"),22.627416998f,tau);
-    e.mv(w("wr_du.weight"),x,rel,384,2304);
+    e.mv(half("wr_du.weight"),x,rel,384,2304);
     attn_norm<<<24,16>>>(rel,w("rel_l2_clip.scale"),8.f,tau);
 
     auto kv = [&](bool key, const float* input){
         std::string name = key ? "k" : "v";
         float* y = tmp(name,1024);
-        e.mv(w("w"+name+"_dv.weight"),input,y,1024,2304);
+        e.mv(half("w"+name+"_dv.weight"),input,y,1024,2304);
         float* dyn = nullptr;
         if (full) {
             dyn = tmp("dynamic",32);
@@ -186,12 +199,15 @@ inline void attn_forward_qkv(Engine& e, int layer, int visit, int pos, const flo
     int first = inkling_context::first(full,pos);
     float* sink = tmp("sink",24), *gate = tmp("gate",3072), *mix = tmp("mix",3072);
     e.mv(w("attn_sink_proj.weight"),x,sink,24,2304);
-    e.mv(w("gate_attn.weight"),x,gate,3072,2304);
+    e.mv(half("gate_attn.weight"),x,gate,3072,2304);
     attn_scores<<<dim3((pos-first+4)/4,24),128>>>(pages,capacity,first,pos,q,rel,w("rel_logits_proj.proj"));
     attn_softmax<<<24,128>>>(pages,capacity,first,pos,sink);
-    attn_mix<<<24,128>>>(pages,capacity,first,pos,gate,mix);
+    const int segments = (pos-first)/attn_segment+1;
+    float* partial = tmp("partial",size_t(segments)*3072);
+    attn_mix<<<dim3(24,segments),128>>>(pages,capacity,first,pos,partial);
+    attn_mix_finish<<<24,128>>>(partial,segments,gate,mix);
     float* projected = tmp("projected",2304);
-    e.mv(w("wo_ud.weight"),mix,projected,2304,3072);
+    e.mv(half("wo_ud.weight"),mix,projected,2304,3072);
     attn_conv<<<18,128>>>(projected,out,e.tmp(state+"ohist",4*2304),e.w(base+"attn_sconv.weight"),nullptr,2304,pos);
 }
 
