@@ -18,7 +18,7 @@ inline void message_gate(Engine& e, const std::string& key, const float* x,
     gate_up<<<blocks,T>>>(low, e.w(key+"forget_weight"), e.w(key+"gain_weight"), x, msg, y);
 }
 
-inline int step(Engine& e, int token, int pos) {
+inline int step(Engine& e, int token, int pos, const float* image_row=nullptr) {
     if (token < 0 || token >= 201024 || pos < 0) throw std::out_of_range("Inkling Mini decode");
     const std::string root = "model.llm.";
     const std::string ar = root + "attn_res.";
@@ -27,7 +27,8 @@ inline int step(Engine& e, int token, int pos) {
     float* prev = tmp("previous", 2*H), *msgs = tmp("messages", 4*H);
     float* input = tmp("input", 3*H), *qkv = tmp("qkv", 3*H);
     float* residual = tmp("residual"), *mlp = tmp("mlp"), *norm = tmp("norm");
-    rms<<<1,T>>>(e.w(root+"embed.weight") + size_t(token)*H, e.w(root+"embed_norm.weight"), h, true);
+    if(image_row) copy(h,image_row,H);
+    else rms<<<1,T>>>(e.w(root+"embed.weight") + size_t(token)*H, e.w(root+"embed_norm.weight"), h, true);
 
     int n = 0, visit = 0; // states[:n] holds normalized, completed blocks
     auto layer_step = [&](int layer, bool cross_pass) {

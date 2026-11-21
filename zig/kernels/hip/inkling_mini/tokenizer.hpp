@@ -30,5 +30,6 @@ public:
         std::ifstream json(dir+"/tokenizer.json"); const auto cfg=nlohmann::json::parse(json);for(auto& t:cfg.at("added_tokens")){std::string s=t.at("content");int n=t.at("id");special[s]=n;words.at(n)=s;}std::string pattern=cfg.at("pre_tokenizer").at("pretokenizers").at(0).at("pattern").at("Regex");int err;size_t off;code=pcre2_compile((PCRE2_SPTR)pattern.data(),pattern.size(),PCRE2_UTF|PCRE2_UCP,&err,&off,nullptr);if(!code)throw std::runtime_error("invalid tokenizer regex");}
     ~TextCodec(){pcre2_code_free(code);}
     const std::string& word(int id)const{return words.at(id);}
-    std::vector<int> turn(const std::string& prompt)const{ std::vector<int> ids;auto tag=[&](const char*s){ids.push_back(special.at(s));};tag("<|message_system|>");tag("<|content_text|>");text(ids,"Thinking effort level: 0");tag("<|end_message|>");tag("<|message_user|>");tag("<|content_text|>");text(ids,prompt);tag("<|end_message|>");return ids;}
+    std::vector<int> turn(const std::string& prompt,size_t rows=0)const{ std::vector<int> ids;auto tag=[&](const char*s){ids.push_back(special.at(s));};tag("<|message_system|>");tag("<|content_text|>");text(ids,"Thinking effort level: 0");tag("<|end_message|>");if(rows){tag("<|message_user|>");tag("<|content_image|>");ids.insert(ids.end(),rows,special.at("<|unused_200054|>"));tag("<|end_message|>");}
+        if(!rows || !prompt.empty()){tag("<|message_user|>");tag("<|content_text|>");text(ids,prompt);tag("<|end_message|>");}return ids;}
 };

@@ -147,20 +147,24 @@ pub fn main(init: std.process.Init) !u8 {
         return 2;
     }
     api.prompt_cache.status.named.store(args.dashboard, .monotonic); // before any store keeps a state
-    if (args.vision) for (@import("core").picture.runtime.warnings(io, a)) |warning| {
-        if (warning) |message| log.line("warning: {s}", .{message});
-    };
     var problem: []const u8 = "";
     const dir = try hub.resolve(a, io, init.environ_map, args.model, &problem) orelse return fail(problem);
     const backend = if (std.mem.eql(u8, args.backend, "auto")) @import("benchmark_server.zig").buildBackend() else args.backend;
-    const draft = try drafter.select(a, io, init.environ_map, dir, args.drafter, args.no_drafts, backend, &problem) orelse return fail(problem);
-    args.drafter = draft.dir;
-    args.drafter_name = draft.name;
-    if (draft.automatic) log.line("drafter {s}, found in the local cache (--drafter none serves without it)", .{draft.name.?});
     const model_type = modelType(a, io, dir, &problem) catch |e| {
         if (e == error.OutOfMemory) return e;
         return fail(problem);
     };
+    if (comptime @import("builtin").os.tag == .linux) {
+        if (std.mem.eql(u8, backend, "rocm") and std.mem.eql(u8, model_type, "inkling2_loop"))
+            return @import("inkling_dispatch.zig").run(init, dir, expanded.argv, args);
+    }
+    if (args.vision) for (@import("core").picture.runtime.warnings(io, a)) |warning| {
+        if (warning) |message| log.line("warning: {s}", .{message});
+    };
+    const draft = try drafter.select(a, io, init.environ_map, dir, args.drafter, args.no_drafts, backend, &problem) orelse return fail(problem);
+    args.drafter = draft.dir;
+    args.drafter_name = draft.name;
+    if (draft.automatic) log.line("drafter {s}, found in the local cache (--drafter none serves without it)", .{draft.name.?});
     if (args.silence.refusal(model_type) orelse args.redraw.refusal(model_type)) |why| return fail(why);
     // a current device profile's certain facts refuse a model this machine cannot run at all; otherwise nothing changes
     if (device_cli.serveRefusal(a, io, init.environ_map, model_type)) |why| return fail(why);

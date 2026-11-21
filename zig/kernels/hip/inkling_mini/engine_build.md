@@ -32,10 +32,10 @@ throws on HIP errors; a subsequent sync may surface asynchronous failures.
 
 ## Single-turn text generation (experimental)
 
-Build `main.hip` with the same settings as the smoke test and link PCRE2-8:
+Build `main.hip` with the same settings as the smoke test and link the PCRE2-8, zlib and hipBLAS development libraries:
 
 ```sh
-hipcc -std=c++17 -O2 --offload-arch=gfx1151 main.hip -lpcre2-8 -o tf-inkling-hip
+hipcc -std=c++17 -O2 --offload-arch=gfx1151 main.hip -lpcre2-8 -lz -lhipblas -o tf-inkling-hip
 ./tf-inkling-hip "$HOME/models/Inkling-2-Mini" 'What is the capital of Japan?' 96
 ```
 
@@ -43,8 +43,31 @@ Install the PCRE2 development headers in the build environment. A standalone
 TensorFold build step is also provided: `zig build -Dhip=true tf-inkling-hip`.
 The direct HIP build is the one exercised on the Radeon 8060S. The CLI performs
 single-turn, batch-one greedy decoding and prints protocol tokens as generated.
-Set `TF_INKLING_TOKEN_IDS=1` to print decimal IDs instead. Tested only with the
-original trusted checkpoint from the reference PR, short text inputs, and zero
-reasoning effort. No multimodal inputs, HTTP serving or MTP. The 4096-position
-CLI cap is not a validated context length. This binary runs independently of
-Python, PyTorch, Transformers and vLLM.
+Set `TF_INKLING_TOKEN_IDS=1` for decimal IDs. This binary runs independently of Python, PyTorch and vLLM.
+
+## Resident loopback server
+
+```sh
+zig build -Dhip=true native-hip tf-inkling-hip
+zig-out/native-hip/bin/tensorfold-native serve /path/to/Inkling-2-Mini \
+  --backend rocm --host 127.0.0.1 --port 18465 --name inkling \
+  --context 16384 --max-tokens 512 --vision
+```
+
+GET `/health` or `/v1/models`; POST `/v1/chat/completions`. One resident engine
+handles one single-user, non-streaming greedy request at a time. `content` is
+the final answer and `reasoning_content` is separate. One optional image comes
+first in the message content array, then text:
+
+```json
+[{"type":"image_url","image_url":{"url":"data:image/png;base64,..."}},
+ {"type":"text","text":"What color is this image?"}]
+```
+
+Supply non-interlaced 8-bit PNG (gray, gray+alpha, RGB or RGBA), up to 256
+merged visual tokens (`ceil(width/40) * ceil(height/40)`). The decoder does
+not fetch remote URLs, accept JPEGs, or silently downsample oversized images.
+Total context includes the template, visual tokens and requested output. The
+limit is 16,384, **not** the checkpoint's advertised 1M; prefill processes one
+token at a time. The JSON body cap is 8 MiB, including base64; text is capped
+at 32 KiB. Long requests occupy the server until completion.

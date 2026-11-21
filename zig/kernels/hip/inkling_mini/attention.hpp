@@ -1,5 +1,5 @@
 #pragma once
-#include "engine.hpp"
+#include "context.hpp"
 #include <hip/hip_runtime.h>
 #include <algorithm>
 #include <cmath>
@@ -56,34 +56,45 @@ static __global__ void attn_conv(const float* x, float* out, float* hist, const 
 // Fixed-size pages avoid allocating model_max_length worth of KV at startup,
 // or relying on tmp() preserving data when resized. Last segment is per-head
 // score scratch. A sliding visit reuses 16 pages in a ring; full visits never wrap.
-static constexpr int attn_page = 64, attn_kv = 1024, attn_heads = 24;
+static constexpr int attn_page = inkling_context::page, attn_kv = inkling_context::kv;
 static __global__ void attn_append(float** pages, int index, float* page, int slot,
                                    const float* k, const float* v) {
     int i = blockIdx.x*blockDim.x+threadIdx.x;
     if (!i) pages[index] = page;
-    page[slot*attn_kv+i] = k[i];
-    page[(attn_page+slot)*attn_kv+i] = v[i];
+    auto* bits = reinterpret_cast<uint16_t*>(page);
+    bits[slot*attn_kv+i] = __float_as_uint(k[i]) >> 16;
+    bits[(attn_page+slot)*attn_kv+i] = __float_as_uint(v[i]) >> 16;
 }
 
 static __device__ inline float* attn_score_ptr(float* page, int h, int t) {
-    return page + 2*attn_page*attn_kv + h*attn_page + t%attn_page;
+    return page + attn_page*attn_kv + h*attn_page + t%attn_page;
+}
+
+static __device__ inline float attn_read(const float* page, int i) {
+    return __uint_as_float(uint32_t(reinterpret_cast<const uint16_t*>(page)[i]) << 16);
 }
 
 static __global__ void attn_scores(float** pages, int capacity, int first, int pos,
                                    const float* q, const float* rel, const float* table) {
-    __shared__ float dot[128];
-    int t = first+blockIdx.x, h = blockIdx.y, d = threadIdx.x, lag = pos-t;
+    // A wave scores one (head,token). Match the original 128-lane reduction
+    // tree: pairs at offsets 64, then 32, then descending shuffle offsets.
+    int lane = threadIdx.x%32, h = blockIdx.y;
+    int t = first+blockIdx.x*4+threadIdx.x/32;
+    if (t > pos) return;
+    int lag = pos-t;
     float* page = pages[(t/attn_page)%capacity];
-    dot[d] = q[h*128+d]*page[(t%attn_page)*attn_kv+(h/3)*128+d];
-    __syncthreads();
-    for (int s = 64; s; s /= 2) {
-        if (d < s) dot[d] += dot[d+s];
-        __syncthreads();
-    }
-    if (!d) {
+    const int offset = (t%attn_page)*attn_kv+(h/3)*128+lane;
+    const float* query = q+h*128+lane;
+    float dots[4];
+    #pragma unroll
+    for (int i=0; i<4; ++i) dots[i] = __fmul_rn(query[32*i],attn_read(page,offset+32*i));
+    float dot = (dots[0]+dots[2]) + (dots[1]+dots[3]);
+    #pragma unroll
+    for (int s=16; s; s/=2) dot += __shfl_down(dot,s,32);
+    if (!lane) {
         float bias = 0.f;
         if (lag < 1024) for (int r = 0; r < 16; ++r) bias += rel[h*16+r]*table[r*1024+lag];
-        *attn_score_ptr(page,h,t) = attn_bf(attn_bf(attn_bf(dot[0])*0.08838834764831844f)+attn_bf(bias));
+        *attn_score_ptr(page,h,t) = attn_bf(attn_bf(attn_bf(dot)*0.08838834764831844f)+attn_bf(bias));
     }
 }
 
@@ -124,21 +135,31 @@ static __global__ void attn_mix(float** pages, int capacity, int first, int pos,
     float sum = 0.f;
     for (int t = first; t <= pos; ++t) {
         float* page = pages[(t/attn_page)%capacity];
-        sum += *attn_score_ptr(page,h,t)*page[(attn_page+t%attn_page)*attn_kv+(h/3)*128+d];
+        sum += *attn_score_ptr(page,h,t)*attn_read(page,(attn_page+t%attn_page)*attn_kv+(h/3)*128+d);
     }
     y[i] = attn_bf(attn_bf(sum)*(1.f/(1.f+expf(-gate[i]))));
 }
 
+inline float** attn_cache_append(Engine& e, const std::string& state, int capacity, int pos,
+                                 const float* k, const float* v) {
+    int index = (pos/attn_page)%capacity;
+    static_assert(sizeof(float*)%sizeof(float)==0,"pointer table size");
+    auto pages = reinterpret_cast<float**>(e.tmp(state+"directory",capacity*sizeof(float*)/sizeof(float)));
+    float* page = e.tmp(state+"page."+std::to_string(index),inkling_context::page_floats);
+    attn_append<<<8,128>>>(pages,index,page,pos%attn_page,k,v);
+    return pages;
+}
+
 inline void attn_forward_qkv(Engine& e, int layer, int visit, int pos, const float* x,
                              const float* xk, const float* xv, float* out) {
-    if (layer < 0 || layer >= 24 || visit < 0 || pos < 0 || pos >= 1048576)
+    if (layer < 0 || layer >= 24 || visit < 0 || visit >= 48 || pos < 0 || pos >= inkling_context::limit)
         throw std::out_of_range("Inkling Mini attention index");
     const bool full = layer%6 == 5;
     const std::string base = "model.llm.layers."+std::to_string(layer)+".";
-    const std::string state = "attn_state."+std::to_string(layer)+"."+std::to_string(visit)+".";
+    const std::string state = inkling_context::state(layer,visit);
     auto w = [&](const std::string& key){ return e.w(base+"attn."+key); };
     auto tmp = [&](const std::string& key, size_t n){ return e.tmp("attn_work."+key,n); };
-    const float tau = full ? 1.f+.1f*std::log(std::max(1.f,(pos+1)/8192.f)) : 1.f;
+    const float tau = inkling_context::tau(full,pos);
     float* q = tmp("q",3072), *rel = tmp("rel",384);
     e.mv(w("wq_du.weight"),x,q,3072,2304);
     attn_norm<<<24,128>>>(q,w("q_l2_clip.scale"),22.627416998f,tau);
@@ -160,16 +181,13 @@ inline void attn_forward_qkv(Engine& e, int layer, int visit, int pos, const flo
         return y;
     };
     float* k = kv(true,xk), *v = kv(false,xv);
-    int capacity = (full ? 1048576 : 1024)/attn_page, index = (pos/attn_page)%capacity;
-    static_assert(sizeof(float*)%sizeof(float)==0,"pointer table size");
-    auto pages = reinterpret_cast<float**>(e.tmp(state+"directory",capacity*sizeof(float*)/sizeof(float)));
-    float* page = e.tmp(state+"page."+std::to_string(index),attn_page*(2*attn_kv+attn_heads));
-    attn_append<<<8,128>>>(pages,index,page,pos%attn_page,k,v);
-    int first = full ? 0 : std::max(0,pos-1023);
+    int capacity = inkling_context::capacity(full);
+    auto pages = attn_cache_append(e,state,capacity,pos,k,v);
+    int first = inkling_context::first(full,pos);
     float* sink = tmp("sink",24), *gate = tmp("gate",3072), *mix = tmp("mix",3072);
     e.mv(w("attn_sink_proj.weight"),x,sink,24,2304);
     e.mv(w("gate_attn.weight"),x,gate,3072,2304);
-    attn_scores<<<dim3(pos-first+1,24),128>>>(pages,capacity,first,pos,q,rel,w("rel_logits_proj.proj"));
+    attn_scores<<<dim3((pos-first+4)/4,24),128>>>(pages,capacity,first,pos,q,rel,w("rel_logits_proj.proj"));
     attn_softmax<<<24,128>>>(pages,capacity,first,pos,sink);
     attn_mix<<<24,128>>>(pages,capacity,first,pos,gate,mix);
     float* projected = tmp("projected",2304);

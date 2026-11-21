@@ -88,12 +88,14 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     if (target.result.os.tag == .linux and std.mem.eql(u8, hip_arch, "gfx1151")) {
         const dir = "zig/kernels/hip/inkling_mini/";
         const mini = hipccRun(b, hipcc, &.{ "-std=c++17", "-O2", "--offload-arch=gfx1151" });
-        for ([_][]const u8{ "model.hpp", "model_ops.hpp", "engine.hpp", "engine_checkpoint.hpp", "attention.hpp", "moe.hpp", "tokenizer.hpp" }) |name|
+        for ([_][]const u8{ "model.hpp", "model_ops.hpp", "engine.hpp", "engine_checkpoint.hpp", "attention.hpp", "moe.hpp", "tokenizer.hpp", "serve.hpp", "serve_http.hpp", "serve_chat.hpp", "context.hpp", "generate.hpp", "vision.hpp", "vision_ops.hpp", "vision_png.hpp" }) |name|
             mini.addFileInput(b.path(b.fmt("{s}{s}", .{ dir, name })));
         mini.addFileArg(b.path(dir ++ "main.hip"));
-        mini.addArgs(&.{ "-lpcre2-8", "-o" });
+        mini.addArgs(&.{ "-lpcre2-8", "-lhipblas", "-lz", "-o" });
         const exe = mini.addOutputFileArg("tf-inkling-hip");
-        b.step("tf-inkling-hip", "Build the standalone Inkling 2 Mini HIP text decoder").dependOn(&b.addInstallFileWithDir(exe, .bin, "tf-inkling-hip").step);
+        const install_mini = b.step("tf-inkling-hip", "Install Inkling 2 Mini standalone and native-hip serve helper");
+        install_mini.dependOn(&b.addInstallFileWithDir(exe, .bin, "tf-inkling-hip").step);
+        install_mini.dependOn(&b.addInstallFileWithDir(exe, .prefix, "native-hip/bin/tf-inkling-hip").step);
     }
     if (caps.Caps.of(hip_arch) == null or std.mem.indexOfScalar(u8, hip_arch, ':') != null)
         std.debug.panic("-Dhip-arch {s} is not an exact name in the caps table (zig/src/hip/caps.zig)", .{hip_arch});
