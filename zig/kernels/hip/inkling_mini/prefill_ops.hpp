@@ -65,30 +65,11 @@ static __global__ void gate_input(const float* x, const float* msg, float* out) 
     normalize((blockIdx.y ? msg : x)+blockIdx.x*H,nullptr,
               out+(2*blockIdx.x+blockIdx.y)*H,true,scratch);
 }
-static __global__ void gate_down(const float* w, const float* input, float* low) {
-    __shared__ float scratch[T];
-    w += blockIdx.x*2*H;
-    input += blockIdx.y*2*H;
-    float v = 0;
-    for (int i=threadIdx.x; i<2*H; i+=T) v = fmaf(w[i],input[i],v);
-    unsigned bits = __float_as_uint(sum(v,scratch));
-    if (!threadIdx.x) { // Engine::mv rounding, including NaN preservation.
-        if ((bits & 0x7fffffff) > 0x7f800000) bits |= 0x00400000;
-        else bits += 0x7fff + ((bits >> 16) & 1);
-        low[blockIdx.y*rank+blockIdx.x] = __uint_as_float(bits & 0xffff0000);
-    }
-}
-static __global__ void gate_output(const float* low, const float* forget, const float* gain,
-                                   const float* x, const float* msg, float* y) {
-    int i = blockIdx.x*T+threadIdx.x;
-    low += blockIdx.y*rank;
-    float f = 0, g = 0;
-    for (int j=0; j<rank; ++j) {
-        f = fmaf(forget[i*rank+j],low[j],f);
-        g = fmaf(gain[i*rank+j],low[j],g);
-    }
-    int idx = blockIdx.y*H+i;
-    y[idx] = (1.f-tanhf(f))*x[idx] + tanhf(g)*msg[idx];
+// forget and gain are the FP32 projections of the BF16-rounded low-rank state.
+static __global__ void gate_mix(const float* forget, const float* gain, const float* x,
+                                const float* msg, float* y) {
+    int idx = blockIdx.x*T+threadIdx.x;
+    y[idx] = (1.f-tanhf(forget[idx]))*x[idx] + tanhf(gain[idx])*msg[idx];
 }
 // x has a three-row prefix containing the scalar history (zero at start).
 static __global__ void finish_rows(const float* x, const float* w, const float* residual, float* h) {

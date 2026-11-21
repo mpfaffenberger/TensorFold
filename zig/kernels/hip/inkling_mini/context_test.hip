@@ -41,7 +41,10 @@ static void exercise(Engine& e, bool full) {
         attn_norm<<<24,16>>>(r,nullptr,8.f,scale);
         attn_scores<<<dim3((pos-lo+4)/4,24),128>>>(pages,cap,lo,pos,q,r,tab);
         attn_softmax<<<24,128>>>(pages,cap,lo,pos,sink);
-        attn_mix<<<24,128>>>(pages,cap,lo,pos,gate,y);
+        const int segments=(pos-lo)/attn_segment+1;
+        float* partial=e.tmp("partial",size_t(segments)*3072);
+        attn_mix<<<dim3(24,segments),128>>>(pages,cap,lo,pos,partial);
+        attn_mix_finish<<<24,128>>>(partial,segments,gate,y);
         std::vector<float> host(3072);
         INKLING_HIP_CHECK(hipMemcpy(host.data(),y,host.size()*4,hipMemcpyDeviceToHost));
         // Independent chronological oracle, never wraps or reads device pages.
@@ -53,11 +56,14 @@ static void exercise(Engine& e, bool full) {
             denom+=probs.back();
         }
         for (int g=0;g<8;++g) {
-            float sum=0;
+            // The kernel's order: keys in sequence within a segment, then segments in sequence.
+            std::vector<float> parts(segments,0.f);
             for (size_t j=0;j<probs.size();++j) {
                 int t=pos+1-int(probs.size())+int(j);
-                sum += bf(probs[j]/denom)*(g+1)*(t==0?-4.f:float(t%3)-1);
+                parts[j/attn_segment] += bf(probs[j]/denom)*(g+1)*(t==0?-4.f:float(t%3)-1);
             }
+            float sum=parts[0];
+            for (int s=1;s<segments;++s) sum += parts[s];
             float expect=bf(bf(sum)*.5f);
             for (int i=g*384;i<(g+1)*384;++i) check(host[i]==expect,"GPU mix vs CPU oracle");
         }

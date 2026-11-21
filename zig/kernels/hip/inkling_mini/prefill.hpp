@@ -2,6 +2,49 @@
 #include "attention_batch.hpp"
 #include "moe_batch.hpp"
 #include "prefill_ops.hpp"
+#include "dense.hpp"
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+
+namespace mini_prefill {
+// TF_INKLING_PROFILE=1 attributes prefill time to stages. It synchronizes the
+// device at every stage boundary, so the profiled run is slower than a normal one.
+struct Stages {
+    enum Stage { glue, attention, experts, count };
+    using Clock = std::chrono::steady_clock;
+    bool enabled = std::getenv("TF_INKLING_PROFILE") != nullptr;
+    double seconds[count] = {};
+    Clock::time_point mark = Clock::now();
+    void lap(Stage stage) {
+        if (!enabled) return;
+        INKLING_HIP_CHECK(hipDeviceSynchronize());
+        auto now = Clock::now();
+        seconds[stage] += std::chrono::duration<double>(now-mark).count();
+        mark = now;
+    }
+    ~Stages() {
+        if (enabled) std::fprintf(stderr,"Inkling prefill stages: attention %.3fs, experts %.3fs, norms/retrieval/gates %.3fs\n",
+                                  seconds[attention],seconds[experts],seconds[glue]);
+    }
+};
+} // namespace mini_prefill
+
+// Upper bound on the device scratch a prefill of `positions` tokens in chunks
+// of `chunk` allocates: the planes below, moe_batch's expert-sorted rows and
+// attn_batch's key window and score block. Zero once a prefill at least this
+// large has run, because Engine scratch is retained between requests.
+inline size_t inkling_prefill_scratch(const Engine& e, size_t positions, size_t chunk) {
+    using mini_prefill::H;
+    const size_t rows = std::min(positions,chunk), group = std::min<size_t>(rows,1024);
+    if (!rows || (e.tmp_capacity("prefill.hidden") >= rows*H && e.tmp_capacity("attn_batch.keys") >= positions*1024))
+        return 0;
+    const size_t planes = 26*rows*H;
+    const size_t experts = rows*8*(2*H + H/2) + size_t(H)*H;
+    const size_t attention = rows*(3*3072 + 384 + 2304 + 1024 + 64) + 2*positions*1024
+                           + 24*std::min<size_t>(size_t(8)<<20,group*positions) + group*24*1024;
+    return (planes + experts + attention)*sizeof(float);
+}
 
 // Start a fresh prompt at position zero. The caller admits prompt + decode
 // before this call. Continue with decode(e, returned_token, ids.size()).
@@ -28,12 +71,14 @@ inline int inkling_prefill(Engine& e, const std::vector<int>& ids, const float* 
     float *prev=planes("prev",2), *msgs=planes("messages",4), *input=planes("input",3);
     float *qkv=planes("qkv",3), *residual=planes("residual"), *norm=planes("norm");
     float *concat=planes("concat",2), *low=tmp("low",capacity*rank);
+    float *forget=planes("forget"), *gain=planes("gain");
     float *mlp=tmp("mlp",(capacity+3)*H);
     static_assert(sizeof(float)==sizeof(int));
     int* device_ids=reinterpret_cast<int*>(tmp("tokens",length));
     INKLING_HIP_CHECK(hipMemcpy(device_ids,tokens.data(),length*sizeof(int),hipMemcpyHostToDevice));
     const std::string root="model.llm.", ar=root+"attn_res.";
     int final_states=0, stride=0;
+    Stages stages;
     for (int start=0; start<length;) {
         int B=std::min(capacity,length-start);
         stride=B*H;
@@ -44,9 +89,10 @@ inline int inkling_prefill(Engine& e, const std::vector<int>& ids, const float* 
         };
         auto gate = [&](const std::string& key, const float* x, const float* msg, float* y) {
             gate_input<<<dim3(B,2),T>>>(x,msg,concat);
-            gate_down<<<dim3(rank,B),T>>>(e.w(key+"down_weight"),concat,low);
-            gate_output<<<dim3(mini_model::blocks,B),T>>>(low,e.w(key+"forget_weight"),
-                                                          e.w(key+"gain_weight"),x,msg,y);
+            mini_dense::linear_bf16(e.w(key+"down_weight"),concat,low,B,2*H,rank);
+            mini_dense::linear(e.w(key+"forget_weight"),low,forget,B,rank,H);
+            mini_dense::linear(e.w(key+"gain_weight"),low,gain,B,rank,H);
+            gate_mix<<<B*mini_model::blocks,T>>>(forget,gain,x,msg,y);
         };
         int n=0, visit=0;
         auto layer_step = [&](int layer, bool cross) {
@@ -72,15 +118,19 @@ inline int inkling_prefill(Engine& e, const std::vector<int>& ids, const float* 
                 }
                 norm_rows<<<B,T>>>(x,e.w(key+(full ? norms[i] : "attn_norm.weight")),qkv+i*stride,true);
             }
+            stages.lap(Stages::glue);
             attn_batch(e,layer,visit,start,qkv,split ? qkv+stride : qkv,
                        split ? qkv+2*stride : qkv,residual,B);
+            stages.lap(Stages::attention);
             if (layer%6==0) ++n;
             else mini_model::add<<<B*mini_model::blocks,T>>>(residual,h,residual);
             norm_rows<<<B,T>>>(residual,nullptr,states+n*stride,false);
             retrieve(states,n+1,e.w(ar+"mlp_queries."+idx),1,input);
             if (cross) gate(key+"controllers.mlp.",input,msgs+3*stride,input);
             norm_rows<<<B,T>>>(input,e.w(key+"mlp_norm.weight"),norm,true);
+            stages.lap(Stages::glue);
             moe_batch(e,layer,norm,mlp+3*H,B);
+            stages.lap(Stages::experts);
             // Prefix + raw MoE rows form one contiguous time series. Copying its
             // tail works even for B=1 or 2, and publishes scalar decode history.
             float* hist=e.tmp("model.mlp_history."+std::to_string(visit),3*H);
@@ -111,7 +161,7 @@ inline int inkling_prefill(Engine& e, const std::vector<int>& ids, const float* 
     retrieve_rows<<<1,T>>>(states+last,final_states+1,stride,e.w(ar+"output_query"),input);
     norm_rows<<<1,T>>>(input,e.w(root+"norm.weight"),norm,true);
     float* logits=e.tmp("model.logits",mini_model::vocab);
-    e.mv(e.w(root+"unembed.weight"),norm,logits,mini_model::vocab,H);
+    e.mv(e.half(root+"unembed.weight"),norm,logits,mini_model::vocab,H);
     int* next=reinterpret_cast<int*>(e.tmp("model.id",1));
     mini_model::greedy<<<1,T>>>(logits,next);
     INKLING_HIP_CHECK(hipGetLastError());
