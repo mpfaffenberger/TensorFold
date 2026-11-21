@@ -1,5 +1,5 @@
 #pragma once
-// One fixed-length HTTP/1.x request per loopback connection; no worker queue in userspace.
+// One fixed-length HTTP/1.x request per connection; no worker queue in userspace.
 #include <arpa/inet.h>
 #include <poll.h>
 #include <sys/socket.h>
@@ -23,6 +23,7 @@ struct Socket {
     explicit Socket(int n) : fd(n) {}
     ~Socket() { if (fd >= 0) close(fd); }
     Socket(const Socket&) = delete;
+    Socket(Socket&& other) noexcept : fd(other.fd) { other.fd = -1; }
 };
 using Clock = std::chrono::steady_clock;
 inline void ready(int fd, short event, Clock::time_point end) {
@@ -42,20 +43,34 @@ inline size_t number(std::string_view s, size_t cap) {
     if (n > cap) throw Error(413,"limit exceeded");
     return n;
 }
-inline void reply(int fd, int code, const std::string& body) {
-    const std::string wire = "HTTP/1.1 " + std::to_string(code) + (code==200?" OK":" Error") +
-        "\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+// False when the client stopped reading or went away.
+inline bool send_all(int fd, std::string_view wire) {
     const auto end = Clock::now()+std::chrono::seconds(5);
-    for (size_t off=0; off<wire.size();) {
-        ready(fd,POLLOUT,end);
-        auto n=send(fd,wire.data()+off,wire.size()-off,MSG_DONTWAIT|MSG_NOSIGNAL);
-        if (n<0 && (errno==EINTR || errno==EAGAIN)) continue;
-        if (n<=0) return;
-        off+=size_t(n);
-    }
+    try {
+        for (size_t off=0; off<wire.size();) {
+            ready(fd,POLLOUT,end);
+            auto n=send(fd,wire.data()+off,wire.size()-off,MSG_DONTWAIT|MSG_NOSIGNAL);
+            if (n<0 && (errno==EINTR || errno==EAGAIN)) continue;
+            if (n<=0) return false;
+            off+=size_t(n);
+        }
+    } catch (const Error&) { return false; }
+    return true;
 }
-struct Request { std::string line, body; };
-inline Request read_request(int fd) {
+inline void reply(int fd, int code, const std::string& body) {
+    send_all(fd, "HTTP/1.1 " + std::to_string(code) + (code==200?" OK":" Error") +
+        "\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body);
+}
+// Server-sent events: no length, the stream ends when the connection closes.
+inline bool begin_events(int fd) {
+    return send_all(fd, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n");
+}
+inline bool send_event(int fd, const std::string& data) { return send_all(fd, "data: " + data + "\n\n"); }
+
+struct Request { std::string line, body, authorization; };
+// loopback_only also refuses Host headers naming anything but this machine,
+// which is what keeps a web page from reaching an unauthenticated local server.
+inline Request read_request(int fd, bool loopback_only) {
     constexpr size_t headers_cap=16384, body_cap=8*1024*1024;
     const auto end=Clock::now()+std::chrono::seconds(10);
     std::string buf;
@@ -79,7 +94,7 @@ inline Request read_request(int fd) {
     auto ver=line.rfind(' ');
     if (ver==line.npos || (line.substr(ver+1)!="HTTP/1.1" && line.substr(ver+1)!="HTTP/1.0")) throw Error(400,"invalid request line");
     line.resize(ver);
-    size_t length=0; bool found=false;
+    size_t length=0; bool found=false; std::string authorization;
     for (pos+=2; pos<split; ) {
         auto e=buf.find("\r\n",pos);
         auto h=buf.substr(pos,e-pos); pos=e+2;
@@ -95,12 +110,13 @@ inline Request read_request(int fd) {
             found=true; length=number(value,body_cap);
         }
         if (name=="origin" && value!="") throw Error(403,"browser origins not supported");
-        if (name=="host" && value.substr(0,value.find(':'))!="127.0.0.1" && value.substr(0,value.find(':'))!="localhost") throw Error(403,"loopback host required");
+        if (name=="authorization") authorization=value;
+        if (loopback_only && name=="host" && value.substr(0,value.find(':'))!="127.0.0.1" && value.substr(0,value.find(':'))!="localhost") throw Error(403,"loopback host required");
         if (name=="content-type" && value.substr(0,value.find(';'))!="application/json") throw Error(415,"expected application/json");
     }
     buf.erase(0,split+4);
     if (buf.size()>length) throw Error(400,"unexpected trailing bytes");
     while (buf.size()<length) more(length-buf.size());
-    return {line,std::move(buf)};
+    return {line,std::move(buf),std::move(authorization)};
 }
 } // namespace ink_http

@@ -1,10 +1,13 @@
 #pragma once
-// Single-user text template. Use the checkpoint's byte ranks and pretokenizer regex.
+// Byte-rank BPE with the checkpoint's pretokenizer regex, and its chat template.
 #define PCRE2_CODE_UNIT_WIDTH 8
 #include <pcre2.h>
+#include <climits>
 #include <fstream>
+#include <memory>
 #include <unordered_map>
 #include "engine_checkpoint.hpp"
+#include "chat.hpp"
 
 class TextCodec {
     std::unordered_map<std::string,int> ranks, special;
@@ -30,6 +33,48 @@ public:
         std::ifstream json(dir+"/tokenizer.json"); const auto cfg=nlohmann::json::parse(json);for(auto& t:cfg.at("added_tokens")){std::string s=t.at("content");int n=t.at("id");special[s]=n;words.at(n)=s;}std::string pattern=cfg.at("pre_tokenizer").at("pretokenizers").at(0).at("pattern").at("Regex");int err;size_t off;code=pcre2_compile((PCRE2_SPTR)pattern.data(),pattern.size(),PCRE2_UTF|PCRE2_UCP,&err,&off,nullptr);if(!code)throw std::runtime_error("invalid tokenizer regex");}
     ~TextCodec(){pcre2_code_free(code);}
     const std::string& word(int id)const{return words.at(id);}
-    std::vector<int> turn(const std::string& prompt,size_t rows=0)const{ std::vector<int> ids;auto tag=[&](const char*s){ids.push_back(special.at(s));};tag("<|message_system|>");tag("<|content_text|>");text(ids,"Thinking effort level: 0");tag("<|end_message|>");if(rows){tag("<|message_user|>");tag("<|content_image|>");ids.insert(ids.end(),rows,special.at("<|unused_200054|>"));tag("<|end_message|>");}
-        if(!rows || !prompt.empty()){tag("<|message_user|>");tag("<|content_text|>");text(ids,prompt);tag("<|end_message|>");}return ids;}
+    // chat_template.jinja for system, user and assistant turns with text and
+    // image parts. The thinking-effort system message precedes the first
+    // non-system message; every part is its own role-tagged segment; an
+    // assistant turn closes with end-of-sampling. There is no generation
+    // prompt. Message text is never scanned for control tokens.
+    std::vector<int> conversation(const std::vector<ChatMessage>& messages, const std::string& effort) const {
+        std::vector<int> ids;
+        auto tag = [&](const char* name) { ids.push_back(special.at(name)); };
+        auto segment = [&](const char* role, const char* kind, const std::string& body) {
+            tag(role); tag(kind); text(ids, body); tag("<|end_message|>");
+        };
+        bool effort_emitted = false;
+        auto emit_effort = [&] {
+            segment("<|message_system|>", "<|content_text|>", "Thinking effort level: " + effort);
+            effort_emitted = true;
+        };
+        for (const auto& message : messages) {
+            const bool assistant = message.role == "assistant";
+            const char* role = message.role == "system" ? "<|message_system|>"
+                             : assistant ? "<|message_model|>" : "<|message_user|>";
+            if (!effort_emitted && message.role != "system") emit_effort();
+            const bool reasoned = assistant && !message.reasoning.empty();
+            if (reasoned) segment(role, "<|content_thinking|>", message.reasoning);
+            for (const auto& part : message.parts) {
+                if (part.image) {
+                    tag(role); tag("<|content_image|>");
+                    ids.insert(ids.end(), part.rows, special.at("<|unused_200054|>"));
+                    tag("<|end_message|>");
+                } else if (message.listed || !part.text.empty() || !reasoned) {
+                    segment(role, "<|content_text|>", part.text);
+                }
+            }
+            if (assistant) tag("<|content_model_end_sampling|>");
+        }
+        if (!effort_emitted) emit_effort();
+        return ids;
+    }
+    // One user turn at zero thinking effort: an optional image, then the text.
+    std::vector<int> turn(const std::string& prompt, size_t rows = 0) const {
+        ChatMessage user{"user", {}, {}, true};
+        if (rows) user.parts.push_back({true, {}, rows});
+        if (!rows || !prompt.empty()) user.parts.push_back({false, prompt, 0});
+        return conversation({user}, "0");
+    }
 };
