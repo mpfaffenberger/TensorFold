@@ -85,6 +85,16 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     const hip_include = o.hip_include orelse
         b.pathResolve(&.{ std.fs.path.dirname(hipcc_resolved) orelse "/opt/rocm/bin", "..", "include" });
     const hip_arch = o.hip_arch orelse "gfx1151";
+    if (target.result.os.tag == .linux and std.mem.eql(u8, hip_arch, "gfx1151")) {
+        const dir = "zig/kernels/hip/inkling_mini/";
+        const mini = hipccRun(b, hipcc, &.{ "-std=c++17", "-O2", "--offload-arch=gfx1151" });
+        for ([_][]const u8{ "model.hpp", "model_ops.hpp", "engine.hpp", "engine_checkpoint.hpp", "attention.hpp", "moe.hpp", "tokenizer.hpp" }) |name|
+            mini.addFileInput(b.path(b.fmt("{s}{s}", .{ dir, name })));
+        mini.addFileArg(b.path(dir ++ "main.hip"));
+        mini.addArgs(&.{ "-lpcre2-8", "-o" });
+        const exe = mini.addOutputFileArg("tf-inkling-hip");
+        b.step("tf-inkling-hip", "Build the standalone Inkling 2 Mini HIP text decoder").dependOn(&b.addInstallFileWithDir(exe, .bin, "tf-inkling-hip").step);
+    }
     if (caps.Caps.of(hip_arch) == null or std.mem.indexOfScalar(u8, hip_arch, ':') != null)
         std.debug.panic("-Dhip-arch {s} is not an exact name in the caps table (zig/src/hip/caps.zig)", .{hip_arch});
     const hip_compile = hipccRun(b, hipcc, &.{ "--genco", b.fmt("--offload-arch={s}", .{hip_arch}), "-O2", "-ffp-contract=off" });

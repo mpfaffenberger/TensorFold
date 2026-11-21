@@ -1,0 +1,50 @@
+# Building the Inkling-2-Mini HIP Engine
+
+Include `engine.hpp` from a HIP C++17 translation unit. Use a 64-bit,
+little-endian Linux host, ROCm HIP headers/compiler/runtime, and the public
+[nlohmann/json](https://github.com/nlohmann/json) headers (3.11 or newer).
+Install `nlohmann-json3-dev` on Debian/Ubuntu or `json-devel` on Fedora,
+inside the build environment, or add `-I/path/to/include` where that directory
+contains `nlohmann/json.hpp`. No JSON link flag, Torch, Python runtime, or
+checkpoint conversion is needed.
+
+From this directory, with ROCm on the compiler and runtime search paths:
+
+```sh
+hipcc -std=c++17 -O2 --offload-arch=gfx1151 engine_smoke.hip -o /tmp/engine-smoke
+/tmp/engine-smoke "$HOME/models/Inkling-2-Mini"
+```
+
+Pass the original checkpoint directory containing `config.json`,
+`model.safetensors.index.json` and its shards. Shards must remain unchanged
+while mapped. Construction checks the model family and shard metadata but
+does not upload weights. `raw` and `w` have independent caches: use `raw` for
+NVFP4/MXFP8 packed tensors. `w` converts the stored scalar dtype (U8 means
+one float per byte, **not** unpacked nibbles).
+
+Use one Engine on one HIP device, from one host thread, on the default stream.
+All pointers are borrowed from the Engine. Scratch contents persist between
+calls. Adding other names never invalidates pointers. Growing the **same**
+name preserves its prefix and zeroes the extension, but invalidates the old
+pointer. `mv` enqueues work; output must not alias either input. Synchronize or
+copy back before consuming results on the host. `INKLING_HIP_CHECK(call)`
+throws on HIP errors; a subsequent sync may surface asynchronous failures.
+
+## Single-turn text generation (experimental)
+
+Build `main.hip` with the same settings as the smoke test and link PCRE2-8:
+
+```sh
+hipcc -std=c++17 -O2 --offload-arch=gfx1151 main.hip -lpcre2-8 -o tf-inkling-hip
+./tf-inkling-hip "$HOME/models/Inkling-2-Mini" 'What is the capital of Japan?' 96
+```
+
+Install the PCRE2 development headers in the build environment. A standalone
+TensorFold build step is also provided: `zig build -Dhip=true tf-inkling-hip`.
+The direct HIP build is the one exercised on the Radeon 8060S. The CLI performs
+single-turn, batch-one greedy decoding and prints protocol tokens as generated.
+Set `TF_INKLING_TOKEN_IDS=1` to print decimal IDs instead. Tested only with the
+original trusted checkpoint from the reference PR, short text inputs, and zero
+reasoning effort. No multimodal inputs, HTTP serving or MTP. The 4096-position
+CLI cap is not a validated context length. This binary runs independently of
+Python, PyTorch, Transformers and vLLM.
