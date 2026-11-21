@@ -19,7 +19,7 @@ static __global__ void token(int t, float* k, float* v) {
 }
 static void exercise(Engine& e, bool full) {
     using namespace inkling_context;
-    int cap = capacity(full);
+    int cap = capacity;
     std::string prefix = state(full ? 5 : 0,full ? 5 : 0);
     auto tmp = [&](const char* k,int n){return e.tmp(k,n);};
     float *k=tmp("k",1024), *v=tmp("v",1024), *q=tmp("q",3072), *r=tmp("r",384), *tab=tmp("tab",16384);
@@ -85,14 +85,15 @@ int main(int argc,char** argv) try {
     }
     inkling_admit(e,limit);
     size_t cold=missing_bytes(e,limit), weights=e.missing_weight_bytes();
-    check(cold-weights==(40*16+8*256)*page_floats*4,"visit schedule");
+    check(cold-weights==size_t(visits)*capacity*page_floats*4,"visit schedule"); // every visit keeps every page
     std::cout<<"cold weight bytes="<<weights<<" pages="<<cold-weights<<'\n';
     const char* image="model.visual.backbone.embeddings.class_embedding";
     e.raw(image); check(e.missing_weight_bytes()==weights,"wrong representation credited");
     e.w(image); check(e.missing_weight_bytes()==weights-1024*4,"image weight not credited");
     exercise(e,false); exercise(e,true);
-    check(missing_bytes(e,limit)==cold-4096-(16+256)*page_floats*4,"warm cache accounting");
+    // The sliding exercise reaches position 2112 (34 pages); the full one fills all 256.
+    check(missing_bytes(e,limit)==cold-4096-(34+256)*page_floats*4,"warm cache accounting");
     check(missing_bytes(e,1)==weights-4096+46*page_floats*4,"shorter request accounting");
-    exercise(e,false); // restart at zero after a wrapped request without clearing pages
+    exercise(e,false); // restart at zero after a longer request without clearing pages
     inkling_admit(e,1); std::cout<<"PASS\n";
 } catch(const std::exception& ex){std::cerr<<ex.what()<<'\n';return 1;}

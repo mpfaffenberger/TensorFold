@@ -1,5 +1,6 @@
 #pragma once
 #include "attention.hpp"
+#include "checkpoint.hpp"
 #include "dense.hpp"
 #include <vector>
 
@@ -105,9 +106,11 @@ static __global__ void gate_rows(float* mix, const float* gate, size_t count) {
 } // namespace inkling_attn_batch
 
 // q/k/v are B contiguous normalized rows each (they may alias). State is shared
-// with scalar attention: continue either API at position start+B.
+// with scalar attention: continue either API at position start+B. `marks` are
+// the checkpoints inside (start,start+B] whose rings to save on the way.
 inline void attn_batch(Engine& e, int layer, int visit, int start, const float* q,
-                       const float* k, const float* v, float* y, int B) {
+                       const float* k, const float* v, float* y, int B,
+                       const std::vector<inkling_checkpoint::Mark>& marks = {}) {
     using namespace inkling_attn_batch;
     using mini_dense::gemm;
     if (layer < 0 || layer >= 24 || visit < 0 || visit >= 48 || start < 0 || B < 0 ||
@@ -117,7 +120,7 @@ inline void attn_batch(Engine& e, int layer, int visit, int start, const float* 
     mini_engine::require(q && k && v && y,"null attention batch operand");
 
     const bool full = layer%6 == 5;
-    const int capacity = inkling_context::capacity(full);
+    const int capacity = inkling_context::capacity;
     const std::string base = "model.llm.layers."+std::to_string(layer)+".";
     const std::string state = inkling_context::state(layer,visit);
     auto w = [&](const std::string& key){ return e.w(base+"attn."+key); };
@@ -149,12 +152,25 @@ inline void attn_batch(Engine& e, int layer, int visit, int start, const float* 
     auto pages = reinterpret_cast<float**>(e.tmp(state+"directory",capacity*sizeof(float*)/sizeof(float)));
     if (past) gather_rows<<<dim3(8,past),128>>>(pages,capacity,window_first,keys,values);
     const int tail = std::min(B,4);
+    // A ring as it stands after `boundary` positions: what it held before this
+    // chunk, then the chunk's own rows up to the boundary. Call before the
+    // live ring takes the chunk's tail.
+    auto checkpoint = [&](const std::string& ring, const float* live, const float* raw, int width) {
+        for (const auto& mark : marks) {
+            float* saved = inkling_checkpoint::saved(e,ring,4*width,mark.slot);
+            INKLING_HIP_CHECK(hipMemcpyAsync(saved,live,4*width*sizeof(float),hipMemcpyDeviceToDevice));
+            const int from = std::max(start,mark.boundary-4);
+            if (mark.boundary > from)
+                hist_rows<<<dim3(width/128,mark.boundary-from),128>>>(raw+size_t(from-start)*width,saved,width,from);
+        }
+    };
     auto key_value = [&](bool is_key, const float* x, float* out){
         const std::string name = is_key ? "k" : "v";
         float* raw = project("w"+name+"_dv.weight",x,"kv_raw",KV);
         float* dynamic = full ? project(name+"_sconv.weight_proj",x,"kv_dynamic",32) : nullptr;
         float* hist = e.tmp(state+name+"hist",4*KV);
         conv_rows<<<dim3(8,B),128>>>(raw,out,hist,w(name+(full ? "_sconv.static_w" : "_sconv.weight")),dynamic,KV,start);
+        checkpoint(state+name+"hist",hist,raw,KV);
         hist_rows<<<dim3(8,tail),128>>>(raw+size_t(B-tail)*KV,hist,KV,start+B-tail);
         norm_heads<<<dim3(8,B),128>>>(out,nullptr,is_key ? 22.627416998f : 0.f,nullptr,KV);
     };
@@ -187,17 +203,14 @@ inline void attn_batch(Engine& e, int layer, int visit, int start, const float* 
     mini_dense::linear_bf16(w("wo_ud.weight"),mix,projected,B,Q,2304);
     float* out_hist = e.tmp(state+"ohist",4*2304);
     conv_rows<<<dim3(18,B),128>>>(projected,y,out_hist,e.w(base+"attn_sconv.weight"),nullptr,2304,start);
+    checkpoint(state+"ohist",out_hist,projected,2304);
     hist_rows<<<dim3(18,tail),128>>>(projected+size_t(B-tail)*2304,out_hist,2304,start+B-tail);
 
-    // Publish the chunk to the paged cache last: a sliding ring would otherwise
-    // overwrite keys that earlier queries in this chunk still attend to.
-    const int keep = std::min(B,capacity*attn_page), first_kept = start+B-keep;
-    for (int index = first_kept/attn_page; index <= (start+B-1)/attn_page; ++index) {
-        const int slot = index%capacity;
-        float* page = e.tmp(state+"page."+std::to_string(slot),inkling_context::page_floats);
-        INKLING_HIP_CHECK(hipMemcpy(pages+slot,&page,sizeof(page),hipMemcpyHostToDevice));
+    // Publish the chunk to the paged cache.
+    for (int index = start/attn_page; index <= (start+B-1)/attn_page; ++index) {
+        float* page = e.tmp(state+"page."+std::to_string(index),inkling_context::page_floats);
+        INKLING_HIP_CHECK(hipMemcpy(pages+index,&page,sizeof(page),hipMemcpyHostToDevice));
     }
-    append_rows<<<dim3(8,keep),128>>>(pages,capacity,first_kept,keys+size_t(past+B-keep)*KV,
-                                      values+size_t(past+B-keep)*KV);
+    append_rows<<<dim3(8,B),128>>>(pages,capacity,start,keys+size_t(past)*KV,values+size_t(past)*KV);
     INKLING_HIP_CHECK(hipGetLastError());
 }

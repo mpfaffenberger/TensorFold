@@ -1,5 +1,6 @@
 """Live checks of the Inkling server's chat behaviour: system prompts, history,
-streaming, tolerated and refused options, and a client that hangs up mid-stream.
+streaming, tool calls, tolerated and refused options, and a client that hangs up
+mid-stream.
 
     python serve_chat_check.py --port 18465 [--api-key KEY]
 """
@@ -55,6 +56,23 @@ class Server:
         client.close()
         return ''.join(answer), ''.join(reasoning), finish, usage, done, first
 
+    def stream_calls(self, messages, **options):
+        """Tool calls assembled from a stream the way OpenAI clients do: by index, concatenating fragments."""
+        client, response = self.post(messages, stream=True, **options)
+        calls, finish = {}, None
+        for raw in response:
+            line = raw.decode('utf-8').strip()
+            if not line.startswith('data: ') or line == 'data: [DONE]':
+                continue
+            for choice in json.loads(line[6:]).get('choices', []):
+                finish = choice.get('finish_reason') or finish
+                for call in choice['delta'].get('tool_calls') or []:
+                    slot = calls.setdefault(call['index'], {'id': call.get('id'), 'name': '', 'arguments': ''})
+                    slot['name'] += call['function'].get('name') or ''
+                    slot['arguments'] += call['function'].get('arguments') or ''
+        client.close()
+        return {'finish': finish, 'calls': [calls[index] for index in sorted(calls)]}
+
 
 def expect(condition, description, detail=''):
     print(('PASS: ' if condition else 'FAIL: ') + description + (f' -> {detail}' if detail and not condition else ''), flush=True)
@@ -96,10 +114,31 @@ def main() -> None:
     status, _ = server.ask([{'role': 'user', 'content': 'Hi'}], max_tokens=1000000)
     expect(status == 200, 'an oversized max_tokens is clamped, not refused', str(status))
 
-    for label, options in (('tools', {'tools': [{'type': 'function', 'function': {'name': 'f', 'parameters': {}}}]}),
+    # A tool round trip: the model asks for the tool, then answers from its result.
+    weather = {'type': 'function', 'function': {'name': 'get_weather', 'description': 'Get the current weather for a city.',
+               'parameters': {'type': 'object', 'properties': {'city': {'type': 'string'}}, 'required': ['city']}}}
+    question = [{'role': 'user', 'content': 'What is the weather in Paris right now?'}]
+    status, reply = server.ask(question, tools=[weather], tool_choice='auto', max_tokens=300)
+    message = reply['choices'][0]['message'] if status == 200 else {}
+    calls = message.get('tool_calls') or [{}]
+    arguments = json.loads(calls[0].get('function', {}).get('arguments', '{}'))
+    expect(reply.get('choices', [{}])[0].get('finish_reason') == 'tool_calls' and calls[0].get('function', {}).get('name') == 'get_weather'
+           and 'paris' in str(arguments.get('city', '')).lower(), 'the model calls an offered tool with JSON arguments', str(reply))
+    result = {'role': 'tool', 'tool_call_id': calls[0]['id'], 'content': json.dumps({'temperature_c': 21, 'sky': 'clear'})}
+    status, reply = server.ask(question + [message, result], tools=[weather], max_tokens=300)
+    answer = reply['choices'][0]['message']['content'] if status == 200 else str(reply)
+    expect(status == 200 and '21' in answer and reply['choices'][0]['finish_reason'] == 'stop', 'the tool result is used in the answer', answer)
+    streamed = server.stream_calls(question, tools=[weather], max_tokens=300)
+    expect(streamed['finish'] == 'tool_calls' and [call['name'] for call in streamed['calls']] == ['get_weather']
+           and 'paris' in json.loads(streamed['calls'][0]['arguments']).get('city', '').lower(), 'tool calls arrive over a stream', str(streamed))
+    status, reply = server.ask([{'role': 'user', 'content': 'Say hello in five words.'}], tools=[weather], max_tokens=300)
+    expect(status == 200 and 'tool_calls' not in reply['choices'][0]['message'], 'an offered tool is left alone when not needed', str(reply))
+
+    for label, options in (('a forced tool choice', {'tools': [weather], 'tool_choice': 'required'}),
                            ('stop sequences', {'stop': ['END']}), ('JSON mode', {'response_format': {'type': 'json_object'}})):
         status, reply = server.ask([{'role': 'user', 'content': 'Hi'}], **options)
-        expect(status == 400 and 'supported' in reply['error']['message'], f'{label}: refused with an explanation', str(reply))
+        expect(status == 400 and ('supported' in reply['error']['message'] or 'cannot' in reply['error']['message']),
+               f'{label}: refused with an explanation', str(reply))
 
     # A client that hangs up must not hold the single engine for the rest of its budget.
     client, response = server.post([{'role': 'user', 'content': 'Write a very long story about a lighthouse.'}], stream=True, max_tokens=4000)

@@ -55,7 +55,7 @@ static __global__ void attn_conv(const float* x, float* out, float* hist, const 
 
 // Fixed-size pages avoid allocating model_max_length worth of KV at startup,
 // or relying on tmp() preserving data when resized. Last segment is per-head
-// score scratch. A sliding visit reuses 16 pages in a ring; full visits never wrap.
+// score scratch. No visit reuses a page: sliding visits just stop reading old ones.
 static constexpr int attn_page = inkling_context::page, attn_kv = inkling_context::kv;
 static __global__ void attn_append(float** pages, int index, float* page, int slot,
                                    const float* k, const float* v) {
@@ -194,7 +194,7 @@ inline void attn_forward_qkv(Engine& e, int layer, int visit, int pos, const flo
         return y;
     };
     float* k = kv(true,xk), *v = kv(false,xv);
-    int capacity = inkling_context::capacity(full);
+    int capacity = inkling_context::capacity;
     auto pages = attn_cache_append(e,state,capacity,pos,k,v);
     int first = inkling_context::first(full,pos);
     float* sink = tmp("sink",24), *gate = tmp("gate",3072), *mix = tmp("mix",3072);

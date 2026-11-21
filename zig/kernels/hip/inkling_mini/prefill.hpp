@@ -46,15 +46,19 @@ inline size_t inkling_prefill_scratch(const Engine& e, size_t positions, size_t 
     return (planes + experts + attention)*sizeof(float);
 }
 
-// Start a fresh prompt at position zero. The caller admits prompt + decode
-// before this call. Continue with decode(e, returned_token, ids.size()).
+// Evaluate positions [resume,ids.size()) of a prompt. resume is 0 for a fresh
+// prompt, or a boundary whose state inkling_checkpoint::restore has put back.
+// With `record`, saves the checkpoints a later prompt can resume from. The
+// caller admits prompt + decode before this call. Continue with
+// decode(e, returned_token, ids.size()).
 inline int inkling_prefill(Engine& e, const std::vector<int>& ids, const float* image_device,
-                           size_t rows, int chunk) {
+                           size_t rows, int chunk, int resume = 0, bool record = false) {
     using namespace mini_prefill;
     using mini_model::copy;
     if (ids.empty() || ids.size()>inkling_context::limit || chunk<1)
         throw std::invalid_argument("invalid Inkling prefill length or chunk size");
     if (rows && !image_device) throw std::invalid_argument("missing projected image rows");
+    if (resume<0 || size_t(resume)>=ids.size()) throw std::invalid_argument("Inkling prefill cannot resume there");
     std::vector<int> tokens(ids);
     size_t row=0;
     for (int& id : tokens) {
@@ -62,7 +66,8 @@ inline int inkling_prefill(Engine& e, const std::vector<int>& ids, const float* 
         if (id==200054 && row<rows) id=~int(row++);
     }
     if (row!=rows) throw std::invalid_argument("image placeholder count mismatch");
-    const int length=int(ids.size()), capacity=std::min(length,chunk);
+    const int length=int(ids.size()), capacity=std::min(length-resume,chunk);
+    const auto checkpoints = record ? inkling_checkpoint::marks(resume,length) : std::vector<inkling_checkpoint::Mark>();
     auto tmp = [&](const char* name, size_t count) {
         return e.tmp(std::string("prefill.")+name,count);
     };
@@ -79,9 +84,12 @@ inline int inkling_prefill(Engine& e, const std::vector<int>& ids, const float* 
     const std::string root="model.llm.", ar=root+"attn_res.";
     int final_states=0, stride=0;
     Stages stages;
-    for (int start=0; start<length;) {
+    for (int start=resume; start<length;) {
         int B=std::min(capacity,length-start);
         stride=B*H;
+        std::vector<inkling_checkpoint::Mark> marks; // those this chunk passes
+        for (const auto& mark : checkpoints)
+            if (mark.boundary>start && mark.boundary<=start+B) marks.push_back(mark);
         embed_rows<<<B,T>>>(device_ids+start,image_device,e.w(root+"embed.weight"),
                             e.w(root+"embed_norm.weight"),h);
         auto retrieve = [&](const float* src, int n, const float* query, int count, float* dst) {
@@ -120,7 +128,7 @@ inline int inkling_prefill(Engine& e, const std::vector<int>& ids, const float* 
             }
             stages.lap(Stages::glue);
             attn_batch(e,layer,visit,start,qkv,split ? qkv+stride : qkv,
-                       split ? qkv+2*stride : qkv,residual,B);
+                       split ? qkv+2*stride : qkv,residual,B,marks);
             stages.lap(Stages::attention);
             if (layer%6==0) ++n;
             else mini_model::add<<<B*mini_model::blocks,T>>>(residual,h,residual);
@@ -133,11 +141,14 @@ inline int inkling_prefill(Engine& e, const std::vector<int>& ids, const float* 
             stages.lap(Stages::experts);
             // Prefix + raw MoE rows form one contiguous time series. Copying its
             // tail works even for B=1 or 2, and publishes scalar decode history.
-            float* hist=e.tmp("model.mlp_history."+std::to_string(visit),3*H);
+            const std::string ring="model.mlp_history."+std::to_string(visit);
+            float* hist=e.tmp(ring,3*H);
             if (start) copy(mlp,hist,3*H);
             else INKLING_HIP_CHECK(hipMemsetAsync(mlp,0,3*H*sizeof(float)));
             finish_rows<<<B*mini_model::blocks,T>>>(mlp,e.w(key+"mlp_sconv.weight"),residual,h);
             copy(hist,mlp+stride,3*H);
+            for (const auto& mark : marks) // the three rows before the boundary
+                copy(inkling_checkpoint::saved(e,ring,3*H,mark.slot),mlp+size_t(mark.boundary-start)*H,3*H);
             ++visit;
         };
         for (int l=0; l<6; ++l) layer_step(l,false);

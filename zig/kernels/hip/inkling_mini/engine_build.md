@@ -67,7 +67,8 @@ needs this mode.
 
 **Conversations** are rendered with the checkpoint's own chat template:
 `system` (or `developer`), `user` and `assistant` turns, text parts, an earlier
-turn's `reasoning_content`, and one image. `chat_template_test.cpp` checks the
+turn's `reasoning_content`, tool calls and results, and one image.
+`chat_template_test.cpp` checks the
 rendering token for token against
 `tools/inkling2_mini/chat-template-reference.json`, which
 `make_chat_template_reference.py` records from the pinned Transformers
@@ -80,11 +81,31 @@ template's own default is `high`, which spends far more tokens thinking.
 `stream_options.include_usage` is set. `usage` is always in a plain reply.
 `max_tokens` above the server's cap or the remaining context is clamped.
 
+**Tools.** `tools` are declared to the model as the chat template prescribes,
+earlier `tool_calls` and `tool` results are rendered into the conversation, and
+a call the model makes comes back as `tool_calls` with `finish_reason`
+`"tool_calls"`. Over a stream a call arrives whole, in one event, once the model
+has finished printing it. Arguments are relayed as the model wrote them; if they
+are not valid JSON the client sees that and can ask again. `tool_choice` may be
+`auto` or `none`. Nothing constrains generation, so a forced choice (`required`
+or a named function) is refused.
+
 **Greedy only.** `temperature`, `top_p`, `seed` and other sampling options are
 accepted and ignored, because ordinary clients always send them. Requests that
-cannot be honoured are refused with 400: `tools` and tool messages, `stop`
+cannot be honoured are refused with 400: a forced `tool_choice`, `stop`
 sequences, JSON `response_format`, `n` above 1, a second image, and images that
 are not inline PNG.
+
+**Shared prefixes are not re-read.** The server keeps the state of the last
+prompt. A request that begins with the same tokens resumes after the shared
+part: at the end of the previous prompt when the conversation simply continues,
+otherwise at the last multiple of 256 tokens inside the shared prefix. An agent
+whose system prompt and tool list take 8,712 tokens waits 40 s for the first
+request and about a second for each one after it (measured, Radeon 8060S).
+`TF_INKLING_PREFIX_CACHE=0` turns this off. Requests with an image are neither
+resumed nor remembered. To make resuming possible every layer keeps its keys
+and values for the whole context, 3.3 GB at 16,384 positions, and snapshots of
+the convolution state take another 0.3 GB.
 
 One optional image goes in a user message's content array:
 
@@ -165,12 +186,20 @@ c++ -std=c++17 serve_test.cpp -o serve-test && ./serve-test   # request parsing,
 c++ -std=c++17 chat_template_test.cpp -lpcre2-8 -o chat-template-test
 ./chat-template-test /path/to/Inkling-2-Mini ../../../../tools/inkling2_mini/chat-template-reference.json
 python tools/inkling2_mini/serve_smoke.py --port 18465        # image and text answers
-python tools/inkling2_mini/serve_chat_check.py --port 18465   # history, streaming, refusals
+python tools/inkling2_mini/serve_chat_check.py --port 18465   # history, streaming, tools, refusals
 python tools/inkling2_mini/bench_prefill.py --port 18465 --document some.txt --max-tokens 1
 ```
 
 The three Python checks read `TENSORFOLD_API_KEY` or take `--api-key`.
 
 `batch-test` requires each batched operator to agree with its scalar kernel to
-BF16 rounding noise (relative RMS under 2e-3) and scalar decode to continue
-from the caches a batched prefill leaves behind.
+BF16 rounding noise (relative RMS under 2e-3), scalar decode to continue from
+the caches a batched prefill leaves behind, and the state saved for resuming to
+equal the scalar path's state at the same position.
+
+Resuming is exact in this sense: a resumed prompt leaves the same logits, bit
+for bit, as the same prompt evaluated from scratch with the work split at the
+same positions. `tools/inkling2_mini/prefix_cache_check.py` restarts the server
+with matching settings and checks that. It is not bit-identical to a run that
+splits the work elsewhere, for the reason above: the same prompt can therefore
+get a different greedy answer warm than cold when two tokens are nearly tied.
