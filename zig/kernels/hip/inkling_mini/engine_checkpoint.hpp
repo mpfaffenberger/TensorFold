@@ -147,6 +147,7 @@ public:
         }
         require(tensors.size() == index.size(), "weight_map references missing tensors");
     }
+    const auto& entries() const { return tensors; }
     const Tensor& get(const std::string& key) const {
         auto it = tensors.find(key);
         if (it == tensors.end()) throw std::out_of_range("Missing Inkling tensor: " + key);

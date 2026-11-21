@@ -83,6 +83,22 @@ public:
     Engine(const Engine&) = delete;
     Engine& operator=(const Engine&) = delete;
 
+    size_t tmp_capacity(const std::string& name) const {
+        auto it = scratch.find(name);
+        return it == scratch.end() ? 0 : it->second.capacity;
+    }
+    // The Mini checkpoint uses U8/F8 only for packed expert weights/scales.
+    // Budget every other tensor expanded, including the visual encoder. Check
+    // the expected representation: raw and expanded caches are independent.
+    size_t missing_weight_bytes() const {
+        size_t bytes = 0;
+        for (const auto& [key,t] : checkpoint.entries()) {
+            bool raw = t.type == mini_engine::Type::u8 || t.type == mini_engine::Type::e4m3;
+            if (!(raw ? packed : weights).count(key))
+                bytes += raw ? t.bytes : mini_engine::product(t.count,sizeof(float));
+        }
+        return bytes;
+    }
     float* tmp(std::string name, size_t count) {
         auto& slot = scratch[name];
         if (count > slot.capacity) {
