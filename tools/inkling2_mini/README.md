@@ -18,6 +18,16 @@ The main shard has SHA-256 `65e60f51aa1284d4fb022584908c315270334d991828bb774af6
 HF_HUB_OFFLINE=1 HF_DEACTIVATE_ASYNC_LOAD=1 python tools/inkling2_mini/check_reference.py /path/to/Inkling-2-Mini
 ```
 
-The script expands the packed experts to BF16 and uses eager attention and
-experts. The original arithmetic run on a Radeon 8060S peaked at 50.2 GiB of
+The checker removes `quantization_config` from the in-memory config to bypass
+ModelOpt quantizer selection and requests BF16, eager attention and eager
+experts. The pinned Transformers loader, not this script, dequantizes the
+checkpoint's NVFP4 and MXFP8 expert weights to the requested parameter dtype.
+No checkpoint files are modified. The original arithmetic run on a Radeon 8060S peaked at 50.2 GiB of
 PyTorch-reserved device memory. No GGUF conversion is involved.
+
+To check the committed prompts and token sequences, fixture validation, and
+comparison logic without PyTorch, a GPU, or the checkpoint, run from the repo root:
+
+```sh
+python3 -m unittest discover -s tools/inkling2_mini -v
+```
