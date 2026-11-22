@@ -2,8 +2,12 @@
 #include "engine.hpp"
 
 namespace inkling_context {
-// Implementation ceiling (tested cache length), not the checkpoint's 1M claim.
-constexpr int limit = 16384, window = 1024, page = 64, kv = 1024, heads = 24;
+// Most positions a request may span. The checkpoint advertises 1M, but every
+// position costs 201 KB of K/V across the 48 visits (211 GB for 1M), so on a
+// device with less memory than that inkling_admit turns a request away first.
+constexpr int limit = 262144, window = 1024, page = 64, kv = 1024, heads = 24;
+// Most positions one prefill chunk evaluates together; its scratch grows with it.
+constexpr int max_chunk = 16384;
 // K/V are already BF16-rounded. Store their high halves losslessly, followed
 // by float score scratch (reused in place by the sink softmax).
 constexpr size_t page_floats = page * (kv + heads);
@@ -22,7 +26,8 @@ inline std::string state(int layer, int visit) {
 constexpr int visits = 48;
 inline int layer_of(int visit) { return visit < 6 ? visit : visit < 42 ? 6 + (visit-6)%12 : visit-24; }
 inline size_t missing_bytes(const Engine& e, size_t positions) {
-    if (!positions || positions > limit) throw std::out_of_range("Inkling context requires 1..16384 positions");
+    if (!positions || positions > limit)
+        throw std::out_of_range("Inkling context requires 1.." + std::to_string(limit) + " positions");
     size_t bytes = e.missing_weight_bytes();
     for (int visit=0; visit<visits; ++visit) {
         const auto prefix = state(layer_of(visit),visit);
@@ -32,10 +37,12 @@ inline size_t missing_bytes(const Engine& e, size_t positions) {
     }
     return bytes;
 }
+// The device has too little free memory for a request of this length.
+struct MemoryShortfall : std::runtime_error { using std::runtime_error::runtime_error; };
 inline void check_budget(size_t need, size_t avail) {
     constexpr size_t reserve = size_t(1)<<30;
     if (avail < reserve || need > avail-reserve)
-        throw std::runtime_error("Inkling context: additional weight/cache bytes=" + std::to_string(need) +
+        throw MemoryShortfall("Inkling context: additional weight/cache bytes=" + std::to_string(need) +
                                  ", free=" + std::to_string(avail) + ", reserve=" + std::to_string(reserve));
 }
 }

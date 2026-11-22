@@ -4,6 +4,7 @@
 #include "prefill_ops.hpp"
 #include "dense.hpp"
 #include <chrono>
+#include <functional>
 #include <cstdio>
 #include <cstdlib>
 
@@ -46,16 +47,22 @@ inline size_t inkling_prefill_scratch(const Engine& e, size_t positions, size_t 
     return (planes + experts + attention)*sizeof(float);
 }
 
+// A caller's `proceed` said to stop: its client is gone.
+struct PrefillCancelled : std::runtime_error { PrefillCancelled() : std::runtime_error("prefill cancelled") {} };
+
 // Evaluate positions [resume,ids.size()) of a prompt. resume is 0 for a fresh
 // prompt, or a boundary whose state inkling_checkpoint::restore has put back.
-// With `record`, saves the checkpoints a later prompt can resume from. The
-// caller admits prompt + decode before this call. Continue with
+// With `record`, saves the checkpoints a later prompt can resume from.
+// `proceed` is asked after every layer visit whether to go on; deep in a long
+// context one visit can take many seconds. The caller admits prompt + decode
+// before this call. Continue with
 // decode(e, returned_token, ids.size()).
 inline int inkling_prefill(Engine& e, const std::vector<int>& ids, const float* image_device,
-                           size_t rows, int chunk, int resume = 0, bool record = false) {
+                           size_t rows, int chunk, int resume = 0, bool record = false,
+                           const std::function<bool()>& proceed = {}) {
     using namespace mini_prefill;
     using mini_model::copy;
-    if (ids.empty() || ids.size()>inkling_context::limit || chunk<1)
+    if (ids.empty() || ids.size()>inkling_context::limit || chunk<1 || chunk>inkling_context::max_chunk)
         throw std::invalid_argument("invalid Inkling prefill length or chunk size");
     if (rows && !image_device) throw std::invalid_argument("missing projected image rows");
     if (resume<0 || size_t(resume)>=ids.size()) throw std::invalid_argument("Inkling prefill cannot resume there");
@@ -150,6 +157,8 @@ inline int inkling_prefill(Engine& e, const std::vector<int>& ids, const float* 
             for (const auto& mark : marks) // the three rows before the boundary
                 copy(inkling_checkpoint::saved(e,ring,3*H,mark.slot),mlp+size_t(mark.boundary-start)*H,3*H);
             ++visit;
+            // moe_batch read its routing back, so the device has finished this visit.
+            if (proceed && !proceed()) throw PrefillCancelled();
         };
         for (int l=0; l<6; ++l) layer_step(l,false);
         copy(pre,h,stride);
