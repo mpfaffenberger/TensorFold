@@ -79,7 +79,7 @@ int main() {
             body(Json::array()), std::string("[]")})
         assert(status_of(refused) == 400);
     assert(status_of(body(Json::array({user("x")}),{{"model","other"}})) == 404);
-    assert(status_of(body(Json::array({user(std::string(300000,'a'))}))) == 413);
+    assert(status_of(body(Json::array({user(std::string(5000000,'a'))}))) == 413);
 
     // Channels: reasoning and answer are separated, and the finish reason reflects who stopped.
     Words codec;

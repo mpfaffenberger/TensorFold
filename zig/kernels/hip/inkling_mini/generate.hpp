@@ -16,22 +16,24 @@ struct PrefixCache { std::vector<int> prompt; };
 // conversation; projected rows of `image` replace (not add to) the embeddings
 // of its placeholder tokens. on_token receives every generated token in order
 // and returns false to stop early. Returns the number of tokens generated.
+// `proceed` is asked throughout prefill whether to go on (see inkling_prefill).
 template<class OnToken>
 inline int inkling_generate(Engine& e, const std::vector<int>& ids, const mini_vision::ImagePatches& image,
-                            int max_tokens, OnToken on_token, PrefixCache* cache = nullptr) {
+                            int max_tokens, OnToken on_token, PrefixCache* cache = nullptr,
+                            const std::function<bool()>& proceed = {}) {
     const size_t rows = size_t(image.rows)*image.cols;
     if (max_tokens < 1 || ids.empty()) throw std::invalid_argument("nothing to generate");
     // 0 selects the token-at-a-time reference prefill, the bit-exact oracle for the batched one.
     const char* requested = std::getenv("TF_INKLING_PREFILL_CHUNK");
     const int chunk = requested ? std::atoi(requested) : 4096;
-    if (chunk < 0 || chunk > inkling_context::limit) throw std::invalid_argument("TF_INKLING_PREFILL_CHUNK must be 0..16384");
+    if (chunk < 0 || chunk > inkling_context::max_chunk) throw std::invalid_argument("TF_INKLING_PREFILL_CHUNK must be 0..16384");
     // Image rows are not part of the token sequence, so prompts with one are neither resumed nor remembered.
     const char* reuse_setting = std::getenv("TF_INKLING_PREFIX_CACHE");
     const bool reuse = cache && chunk && !rows && !(reuse_setting && std::string(reuse_setting) == "0");
     const int resume = reuse ? inkling_checkpoint::resume_point(cache->prompt, ids) : 0;
     if (cache) cache->prompt.clear(); // this request overwrites the state it described
     size_t scratch = inkling_prefill_scratch(e, ids.size()-resume, chunk);
-    if (reuse && !e.tmp_capacity("checkpoint.model.mlp_history.0")) scratch += inkling_checkpoint::bytes();
+    if (reuse) scratch += inkling_checkpoint::missing_bytes(e, ids.size());
     inkling_admit(e, ids.size()+max_tokens, scratch);
     float* device = nullptr;
     if (rows) {
@@ -48,7 +50,7 @@ inline int inkling_generate(Engine& e, const std::vector<int>& ids, const mini_v
     int next = 0;
     if (chunk) {
         if (resume) inkling_checkpoint::restore(e, resume);
-        next = inkling_prefill(e, ids, device, rows, chunk, resume, reuse);
+        next = inkling_prefill(e, ids, device, rows, chunk, resume, reuse, proceed);
         if (reuse) cache->prompt = ids;
     }
     else {

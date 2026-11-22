@@ -13,9 +13,10 @@
 // evaluates only what follows.
 namespace inkling_checkpoint {
 constexpr int spacing = 256, hidden = 2304, kv = inkling_context::kv;
-constexpr int slots = inkling_context::limit/spacing + 1; // one per grid boundary, one for a prompt end off the grid
+constexpr int block = 64; // snapshots allocated together: one block spans 16,384 positions
+// slot: the grid boundary's index, or -1 for a prompt end off the grid.
 struct Mark { int boundary, slot; };
-inline int slot_of(int boundary) { return boundary%spacing ? slots-1 : boundary/spacing-1; }
+inline int slot_of(int boundary) { return boundary%spacing ? -1 : boundary/spacing-1; }
 
 // The snapshots a prefill of positions [resume,length) must write.
 inline std::vector<Mark> marks(int resume, int length) {
@@ -40,15 +41,19 @@ inline std::vector<Ring> rings(int visit) {
     return {{state+"khist",4*kv},{state+"vhist",4*kv},{state+"ohist",4*hidden},
             {"model.mlp_history."+std::to_string(visit),3*hidden}};
 }
-// Where a ring's snapshot for `slot` lives.
+// Where a ring's snapshot for `slot` lives. Blocks are allocated as prompts reach them.
+inline std::string block_name(int index, const std::string& ring) { return "checkpoint."+std::to_string(index)+"."+ring; }
 inline float* saved(Engine& e, const std::string& ring, int width, int slot) {
-    return e.tmp("checkpoint."+ring,size_t(slots)*width) + size_t(slot)*width;
+    if (slot < 0) return e.tmp("checkpoint.end."+ring,width);
+    return e.tmp(block_name(slot/block,ring),size_t(block)*width) + size_t(slot%block)*width;
 }
-// Device memory all snapshots take once allocated.
-inline size_t bytes() {
-    size_t floats = 0;
-    for (const auto& ring : rings(0)) floats += size_t(slots)*ring.width;
-    return floats*inkling_context::visits*sizeof(float);
+// Device memory the snapshots of a prompt of `positions` tokens still need.
+inline size_t missing_bytes(const Engine& e, size_t positions) {
+    size_t floats = 0, blocks = 0;
+    for (const auto& ring : rings(0)) floats += ring.width;
+    for (size_t index=0; index<=positions/spacing/block; ++index) blocks += !e.tmp_capacity(block_name(int(index),rings(0)[0].name));
+    const bool end = !e.tmp_capacity("checkpoint.end."+rings(0)[0].name);
+    return (blocks*block + end)*floats*inkling_context::visits*sizeof(float);
 }
 // Put every ring back as it stood after `boundary` positions.
 inline void restore(Engine& e, int boundary) {

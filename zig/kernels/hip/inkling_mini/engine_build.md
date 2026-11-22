@@ -51,7 +51,7 @@ Set `TF_INKLING_TOKEN_IDS=1` for decimal IDs. This binary runs independently of 
 zig build -Dhip=true native-hip tf-inkling-hip
 zig-out/native-hip/bin/tensorfold-native serve /path/to/Inkling-2-Mini \
   --backend rocm --host 127.0.0.1 --port 18465 --name inkling \
-  --context 16384 --max-tokens 4096 --vision
+  --context 262144 --max-tokens 4096 --vision
 ```
 
 GET `/health` or `/v1/models`; POST `/v1/chat/completions`. One resident engine
@@ -104,8 +104,8 @@ whose system prompt and tool list take 8,712 tokens waits 40 s for the first
 request and about a second for each one after it (measured, Radeon 8060S).
 `TF_INKLING_PREFIX_CACHE=0` turns this off. Requests with an image are neither
 resumed nor remembered. To make resuming possible every layer keeps its keys
-and values for the whole context, 3.3 GB at 16,384 positions, and snapshots of
-the convolution state take another 0.3 GB.
+and values for the whole context, and snapshots of the convolution state add
+about 9% to that (see Context length).
 
 One optional image goes in a user message's content array:
 
@@ -118,8 +118,37 @@ Supply non-interlaced 8-bit PNG (gray, gray+alpha, RGB or RGBA), up to 256
 merged visual tokens (`ceil(width/40) * ceil(height/40)`). The decoder does
 not fetch remote URLs, accept JPEGs, or silently downsample oversized images.
 Total context includes the template, visual tokens and requested output. The
-limit is 16,384, **not** the checkpoint's advertised 1M. The JSON body cap is
-8 MiB, including base64; message text is capped at 256 KiB.
+JSON body cap is 8 MiB, including base64; message text is capped at 4 MiB.
+
+## Context length
+
+`--context` accepts up to 262,144 positions. That is this implementation's
+ceiling, not the checkpoint's advertised 1M, and on most devices memory ends a
+request before the ceiling does:
+
+* **Memory.** Every position stores 201 KB of keys and values across the 48
+  layer visits, plus 18 KB of resume snapshots: 3.6 GB per 16,384 positions,
+  57 GB at the ceiling, and it would be 230 GB for 1M. Pages are allocated as
+  a conversation reaches them and kept afterwards. A request that would not
+  fit in the memory free at that moment is refused with 503 before anything is
+  sent.
+* **Time.** Reading a prompt is not linear: the eight full-attention visits
+  compare every position with every earlier one. Measured on a Radeon 8060S:
+  35,723 tokens cold in 221 s (161 tok/s); continuing from there to 98,113
+  tokens took another 1,006 s (62 tok/s), about 20 minutes in all.
+* **Generation slows with context**, because each new token attends to every
+  position in those eight visits: 17 tok/s on a short prompt, 14 tok/s at 9K,
+  7.4 tok/s at 36K, 3.8 tok/s at 98K.
+
+A fact planted at the start was recalled at 35,723 and at 98,113 tokens, and a
+second question about the same document began after 3 s and 6.5 s (the shared
+prefix is not re-read). Nothing longer has been run end to end; the attention
+kernels are checked against a CPU oracle at position 262,143 by `context-test`.
+
+While a long prompt is being read, a stream carries an empty delta every 15
+seconds. That keeps a proxy with an idle timeout (Cloudflare's is
+100 s) from dropping the request, and lets the server stop reading when the
+client has gone. A request that is not streamed has no such protection.
 
 ## Speed, and what bounds it
 

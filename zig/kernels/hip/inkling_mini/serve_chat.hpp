@@ -104,7 +104,7 @@ inline std::string invoke_body(const std::string& name, const Ordered& given) {
 }
 
 inline ChatRequest parse_chat(const std::string& raw, const std::string& model) {
-    constexpr size_t text_cap = 256*1024; // bounds tokenizer work; the context limit is enforced in tokens
+    constexpr size_t text_cap = 4*1024*1024; // bounds tokenizer work; the context limit is enforced in tokens
     size_t events=0;
     auto j=Ordered::parse(raw,[&](int depth, Ordered::parse_event_t, Ordered&) {
         if (depth>32 || ++events>400000) throw Error(413,"chat JSON too complex");
@@ -139,7 +139,7 @@ inline ChatRequest parse_chat(const std::string& raw, const std::string& model) 
     size_t text_bytes=0;
     auto text_part = [&](const Ordered& text) {
         if (!text.is_string()) throw Error(400,"message text must be a string");
-        if ((text_bytes += text.get_ref<const std::string&>().size()) > text_cap) throw Error(413,"messages exceed 262144 bytes of text");
+        if ((text_bytes += text.get_ref<const std::string&>().size()) > text_cap) throw Error(413,"messages exceed 4 MiB of text");
         return ChatPart{false,text.get<std::string>(),0};
     };
     for (const auto& item : j["messages"]) {

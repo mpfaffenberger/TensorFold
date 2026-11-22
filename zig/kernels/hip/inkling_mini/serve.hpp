@@ -83,6 +83,9 @@ inline Json chat(int fd, const ServeOptions& options, Engine& engine, PrefixCach
     if (prompt.size() >= size_t(options.context)) throw Error(400,"the conversation does not fit the context window");
     const int room = options.context-int(prompt.size());
     const int budget = std::min({request.max_tokens ? request.max_tokens : options.max_tokens,options.max_tokens,room});
+    // Refuse a context the device cannot hold before any of the response is sent.
+    try { inkling_admit(engine,prompt.size()+budget); }
+    catch (const inkling_context::MemoryShortfall&) { throw Error(503,"not enough free GPU memory for a conversation this long"); }
 
     if (!request.stream) {
         std::vector<int> ids;
@@ -104,6 +107,7 @@ inline Json chat(int fd, const ServeOptions& options, Engine& engine, PrefixCach
         connected = send_event(fd,dump(chunk(options.model,serial,{{field,pending.substr(0,ready_bytes)}})));
         pending.erase(0,ready_bytes);
     };
+    auto last_event = Clock::now();
     // A tool call is relayed whole once the model has finished printing it.
     size_t relayed = 0;
     auto relay_calls = [&] {
@@ -122,7 +126,18 @@ inline Json chat(int fd, const ServeOptions& options, Engine& engine, PrefixCach
             flush(false);
             relay_calls();
             return connected;
-        },&cache);
+        },&cache,[&] {
+            // While a long prompt is read: an empty delta every 15 s keeps proxies from
+            // timing the request out, and finds out whether anyone still waits for it.
+            if (Clock::now()-last_event < std::chrono::seconds(15)) return true;
+            last_event = Clock::now();
+            return connected = send_event(fd,dump(chunk(options.model,serial,Json::object())));
+        });
+    } catch (const PrefillCancelled&) {
+        return nullptr;
+    } catch (const inkling_context::MemoryShortfall&) {
+        if (connected) send_event(fd,dump(Json{{"error",{{"message","not enough free GPU memory for a conversation this long"},{"type","server_error"}}}}));
+        return nullptr;
     } catch (const std::exception& error) {
         std::cerr << "Inkling generation: " << error.what() << '\n';
         if (connected) send_event(fd,dump(Json{{"error",{{"message","generation failed"},{"type","server_error"}}}}));
@@ -174,6 +189,7 @@ inline int inkling_serve(int argc, char** argv) {
                 if (response.is_null()) continue; // already streamed
             } else throw Error(404,"unknown route or method");
         } catch (const Error& error) { status = error.status; response = error.what(); }
+        catch (const inkling_context::MemoryShortfall&) { status = 503; response = "not enough free GPU memory for a conversation this long"; }
         catch (const Json::exception&) { status = 400; response = "invalid chat JSON"; }
         catch (const std::invalid_argument& error) { status = 400; response = error.what(); }
         catch (const std::out_of_range& error) { status = 400; response = error.what(); }

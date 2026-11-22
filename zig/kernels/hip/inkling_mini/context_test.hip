@@ -27,7 +27,7 @@ static void exercise(Engine& e, bool full) {
     std::vector<float> ones(3072,1.f);
     float bias=3.f;
     INKLING_HIP_CHECK(hipMemcpy(tab,&bias,4,hipMemcpyHostToDevice));
-    int end = full ? 16383 : 2112;
+    int end = full ? limit-1 : 2112;
     for (int pos=0; pos<=end; ++pos) {
         token<<<8,128>>>(pos,k,v);
         auto pages=attn_cache_append(e,prefix,cap,pos,k,v);
@@ -83,7 +83,8 @@ int main(int argc,char** argv) try {
         bool rejected=false; try {check_budget(500,free_bytes);} catch (const std::runtime_error&) {rejected=true;}
         check(rejected,"low-memory rejection");
     }
-    inkling_admit(e,limit);
+    // The longest context needs more memory than most devices have free; a short one must be admitted.
+    inkling_admit(e,16384);
     size_t cold=missing_bytes(e,limit), weights=e.missing_weight_bytes();
     check(cold-weights==size_t(visits)*capacity*page_floats*4,"visit schedule"); // every visit keeps every page
     std::cout<<"cold weight bytes="<<weights<<" pages="<<cold-weights<<'\n';
@@ -91,8 +92,8 @@ int main(int argc,char** argv) try {
     e.raw(image); check(e.missing_weight_bytes()==weights,"wrong representation credited");
     e.w(image); check(e.missing_weight_bytes()==weights-1024*4,"image weight not credited");
     exercise(e,false); exercise(e,true);
-    // The sliding exercise reaches position 2112 (34 pages); the full one fills all 256.
-    check(missing_bytes(e,limit)==cold-4096-(34+256)*page_floats*4,"warm cache accounting");
+    // The sliding exercise reaches position 2112 (34 pages); the full one fills every page.
+    check(missing_bytes(e,limit)==cold-4096-(34+size_t(capacity))*page_floats*4,"warm cache accounting");
     check(missing_bytes(e,1)==weights-4096+46*page_floats*4,"shorter request accounting");
     exercise(e,false); // restart at zero after a longer request without clearing pages
     inkling_admit(e,1); std::cout<<"PASS\n";
